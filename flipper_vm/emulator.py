@@ -91,20 +91,27 @@ class GPIO(Peripheral):
         if offset == self.BSRR:
             odr = int.from_bytes(self.regs[self.ODR:self.ODR + 4], "little")
             if value & 0xFFFF0000:
-                odr &= ~(value >> 16) & 0xFFFF
+                odr &= ~((value >> 16) & 0xFFFF)
             odr |= value & 0xFFFF
             self.regs[self.ODR:self.ODR + 4] = (odr & 0xFFFF).to_bytes(4, "little")
+            self._on_odr_change(odr)
             return
         if offset == self.BRR:
             odr = int.from_bytes(self.regs[self.ODR:self.ODR + 4], "little")
             odr &= ~(value & 0xFFFF)
             self.regs[self.ODR:self.ODR + 4] = (odr & 0xFFFF).to_bytes(4, "little")
+            self._on_odr_change(odr)
             return
         if offset == self.ODR:
             super().write(offset, size, value)
             self._on_odr_change(value)
             return
+        # 其它寄存器(MODER / OTYPER / OSPEEDR / PUPDR / AFRL / AFRH 等)
+        # 固件初始化时通常按 MODER -> ODR/BSRR 顺序配置,只写 MODER 时不会触发
+        # DC/RST 钩子,这里在写完其它寄存器后也主动回调一次,确保 ODR 的当前值被推送到外设。
         super().write(offset, size, value)
+        odr = int.from_bytes(self.regs[self.ODR:self.ODR + 4], "little")
+        self._on_odr_change(odr)
 
     def _on_odr_change(self, odr):
         """子类钩子:用于检测 DC / RST 引脚变化。"""
@@ -202,7 +209,10 @@ class USART(Peripheral):
 class ST7567DisplayAdapter:
     """把 ST7567 包装成有 framebuffer 接口的对象。"""
     def __init__(self):
+        from .stm32wb55 import DISPLAY_WIDTH, DISPLAY_HEIGHT
         self.lcd = ST7567()
+        self.width  = DISPLAY_WIDTH
+        self.height = DISPLAY_HEIGHT
 
     @property
     def fb(self):
@@ -222,6 +232,25 @@ class ST7567DisplayAdapter:
     def set_dc(self, v): self.lcd.set_dc(v)
     def set_reset(self, a): self.lcd.set_reset(a)
     def spi_write(self, b): self.lcd.spi_write(b)
+
+    # --- 方便 GUI 调试 / 测试脚本直接画像素 ---
+    def clear(self) -> None:
+        self.lcd.fb = [0] * (self.width * self.height)
+        self.lcd._dirty = True
+
+    def set_pixel(self, x: int, y: int, on: int) -> None:
+        if 0 <= x < self.width and 0 <= y < self.height:
+            self.lcd.fb[y * self.width + x] = 1 if on else 0
+            self.lcd._dirty = True
+
+    def turn_on(self) -> None:
+        """打开 LCD 显示(发 ST7567 0xAF 命令),让 GUI 画像素时真的能看到。"""
+        self.lcd.display_on = True
+        self.lcd._dirty = True
+
+    def turn_off(self) -> None:
+        self.lcd.display_on = False
+        self.lcd._dirty = True
 
 
 # ====== 仿真核心 ======
@@ -332,6 +361,13 @@ class FlipperVM:
         # 设置 VTOR 指向 Flash 起始(在 PPB 中)
         vtor = FLASH_BASE
         self.ppb[SCB_VTOR - PPB_BASE:SCB_VTOR - PPB_BASE + 4] = vtor.to_bytes(4, "little")
+
+        # 外设合理初值:GPIOB PB11(DC) 默认低=命令模式,GPIOC PC9(RST) 默认高=解除复位
+        self.gpiob.write(self.gpiob.ODR, 4, 0)
+        self.gpioc.write(self.gpioc.ODR, 4, (1 << 9))
+        # 为了兼容"固件未发 0xAF 开屏命令"的情况,默认强制打开显示
+        # (真正的 Flipper Zero 启动时 LCD 本来就是亮的,固件会在初始化序列里再写 0xAF)
+        self.display.turn_on()
 
     # ---------- 按键 ----------
     def set_button(self, name: str, pressed: bool) -> None:

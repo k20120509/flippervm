@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QColor, QKeyEvent
+from PySide6.QtGui import QPainter, QColor, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QPushButton, QVBoxLayout,
     QHBoxLayout, QLabel, QPlainTextEdit, QSlider, QGroupBox, QFrame,
@@ -56,16 +56,20 @@ class DisplayWidget(QWidget):
                    DISPLAY_WIDTH * self.SCALE, DISPLAY_HEIGHT * self.SCALE,
                    QColor("#7da14a"))  # 经典绿黑 LCD
         if not self.vm.display.display_on:
-            p.end()
-            return
+            # 即使 display_on=关,仍然把 framebuffer 内容画出来,
+            # 但使用较暗的颜色提示"屏幕关闭",避免用户完全看不到任何反馈。
+            # 真正关闭时(例如 LCD reset 中),framebuffer 通常也是全 0,画面自然是一片空。
+            pass
         fb = self.vm.display.fb
+        # 点亮像素颜色:屏幕开启用深绿,关闭状态用半透明灰色
+        pixel_color = QColor("#0d1f0a") if self.vm.display.display_on else QColor("#2a3a25")
         for y in range(DISPLAY_HEIGHT):
             for x in range(DISPLAY_WIDTH):
                 if fb[y * DISPLAY_WIDTH + x]:
                     p.fillRect(inner_x + x * self.SCALE,
                                inner_y + y * self.SCALE,
                                self.SCALE, self.SCALE,
-                               QColor("#0d1f0a"))
+                               pixel_color)
         p.end()
 
 
@@ -336,7 +340,7 @@ class MainWindow(QMainWindow):
     def _on_uart_byte(self, b: int):
         ch = chr(b) if 32 <= b < 127 else (chr(b) if b in (9, 10, 13) else "")
         if ch:
-            self.console.moveCursor(self.console.textCursor().End)
+            self.console.moveCursor(QTextCursor.MoveOperation.End)
             self.console.insertPlainText(ch)
 
 
