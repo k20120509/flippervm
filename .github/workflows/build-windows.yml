@@ -2,93 +2,186 @@ name: Build Windows Release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号,如 v0.2.1"
+        description: "版本号,如 v0.3.0"
         required: false
-        default: "v0.2.1"
+        default: "v0.3.0"
 
 permissions:
   contents: write
 
-jobs:
-  build-exe:
-    name: 构建 Windows 单文件 exe
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+# 避免多个 job 同时写同一个 Release 竞态
+concurrency:
+  group: release-assets-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
-      - uses: actions/setup-python@v5
+env:
+  PYVER: "3.11"
+
+jobs:
+  # -------- Job 1: 构建单文件 exe,并上传到已有 Release --------
+  build-exe:
+    name: 构建 Windows 单文件 exe (PyInstaller)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ env.PYVER }} (x64)
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYVER }}
           architecture: x64
 
-      - name: 安装依赖
+      - name: 读取版本号(校验单一事实源)
+        id: ver
+        shell: pwsh
+        run: |
+          $v = python -c "from flipper_vm._version import __version__; print(__version__)"
+          Write-Host "APP_VERSION=$v"
+          "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 安装运行依赖 + PyInstaller
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
-      - name: PyInstaller 打包
-        run: pyinstaller --noconfirm --clean flippervm.spec
-
-      - name: 检查产物
+      - name: PyInstaller 打包(使用 flippervm.spec,自动注入 VersionInfo)
+        shell: pwsh
         run: |
-          if (!(Test-Path "dist\FlipperVM.exe")) {
-            Write-Error "未找到 dist\FlipperVM.exe"
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist)  { Remove-Item -Recurse -Force dist  }
+          python -m PyInstaller --noconfirm --clean flippervm.spec
+
+      - name: 校验 exe 产物存在 + 非空
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist\FlipperVM.exe" -ErrorAction Stop
+          if ($exe.Length -lt 20MB) {
+            Write-Error "FlipperVM.exe 只有 $([int]($exe.Length/1MB))MB,明显小于预期,打包失败"
             exit 1
           }
-          Get-Item dist\FlipperVM.exe | Format-List Name,Length
+          Write-Host "OK: FlipperVM.exe 大小 = $([math]::Round($exe.Length/1MB,1))MB"
 
       - name: 上传 exe 到 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          name: FlipperVM ${{ github.event.inputs.version || github.ref_name }}
-          files: dist\FlipperVM.exe
-          fail_on_unmatched_files: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ github.event.inputs.version }}") { "${{ github.event.inputs.version }}" } else { "${{ github.ref_name }}" }
+          Write-Host "tag = $tag"
+          Write-Host "APP_VERSION (from _version.py) = $env:APP_VERSION"
+          # 若 Release 还不存在,先创建(softprops 之外的兜底,本仓库通常先由人手动创建)
+          if (-not (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "FlipperVM $tag" --notes "Automatically created by CI" --latest
+          }
+          # 先删除本文件同名的旧资产(若有),再上传
+          gh release delete-asset $tag FlipperVM.exe --repo $env:GITHUB_REPOSITORY --yes 2>$null || $true
+          gh release upload $tag "dist\FlipperVM.exe" --repo $env:GITHUB_REPOSITORY --clobber
 
+  # -------- Job 2: 构建便携版 zip,并上传到已有 Release --------
   build-portable:
-    name: 构建免装便携版 zip
+    name: 构建免装便携版 zip (embeddable Python)
     runs-on: windows-latest
+    timeout-minutes: 90
+    needs: [build-exe]              # 串行,避免同时写 Release 竞态
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout 源码
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: 设置 Python ${{ env.PYVER }} (x64)
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYVER }}
           architecture: x64
 
-      - name: 下载 embeddable Python
+      - name: 下载 embeddable Python ${{ env.PYVER }}.9
         shell: pwsh
         run: |
           $url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
-          Invoke-WebRequest -Uri $url -OutFile python-embed.zip
+          $ProgressPreference = "SilentlyContinue"
+          Write-Host "正在从 python.org 下载 embeddable 包 (通常 10-20MB)..."
+          $maxRetries = 5
+          for ($i=1; $i -le $maxRetries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile python-embed.zip -UseBasicParsing
+              break
+            } catch {
+              Write-Host "  重试 $i / $maxRetries : $_"
+              Start-Sleep -Seconds ($i * 5)
+            }
+          }
+          if (-not (Test-Path python-embed.zip)) { throw "embeddable 包下载失败" }
+          Write-Host "OK: $(Get-Item python-embed.zip | % Length) bytes"
 
-      - name: 组装便携包
+      - name: 组装便携版目录
         shell: pwsh
         run: |
-          $root = "dist-p\FlipperVM"
-          New-Item -ItemType Directory -Force -Path "$root\python", "$root\python\Lib\site-packages", "$root\app" | Out-Null
-          Expand-Archive -Path python-embed.zip -DestinationPath "$root\python" -Force
-          pip install --target "$root\python\Lib\site-packages" PySide6 unicorn
+          $root = "out-p\FlipperVM"
+          New-Item -ItemType Directory -Force -Path `
+            "$root\python", "$root\python\Lib\site-packages", "$root\app" | Out-Null
 
+          # 1) 解压 embeddable Python
+          Expand-Archive -Path python-embed.zip -DestinationPath "$root\python" -Force
+
+          # 2) pip 安装运行时依赖到便携包的 site-packages
+          Write-Host "正在 pip 安装 PySide6 + unicorn 到便携包..."
+          python -m pip install --upgrade --target "$root\python\Lib\site-packages" PySide6 unicorn
+          # 清理 __pycache__ 以减小体积
+          Get-ChildItem "$root\python\Lib\site-packages" -Recurse -Directory -Filter __pycache__ |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "$root\python\Lib\site-packages" -Recurse -File -Filter *.pyc |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+          # 3) 拷贝 FlipperVM 源码
           Copy-Item main.py -Destination "$root\app\"
           Copy-Item flipper_vm -Recurse -Destination "$root\app\"
-          Copy-Item README.md,requirements.txt -Destination "$root\app\"
+          Copy-Item README.md, requirements.txt -Destination "$root\app\"
 
-          # 写启动 bat
+          # 4) 启动脚本 FlipperVM.bat (带控制台)
           @"
 @echo off
+REM =============================================================
+REM  FlipperVM 便携版一键启动脚本
+REM  用法:双击本 bat 即可运行,无需安装 Python 或任何依赖
+REM =============================================================
 setlocal
 cd /d "%~dp0"
-"%~dp0python\python.exe" "%~dp0app\main.py" %*
+if not exist "app\main.py" (
+    echo [错误] 找不到 app\main.py,请确认已完整解压本压缩包。
+    pause
+    exit /b 1
+)
+if exist "python\python.exe" (
+    "%~dp0python\python.exe" "%~dp0app\main.py" %*
+) else (
+    echo [错误] 找不到 python\python.exe,请确认已完整解压本压缩包。
+    pause
+    exit /b 1
+)
 endlocal
 "@ | Set-Content -Encoding ASCII "$root\FlipperVM.bat"
 
-          # 写 python311._pth
+          # 4b) 启动脚本 FlipperVM_无控制台.bat (纯图形界面)
+          @"
+@echo off
+REM =============================================================
+REM  FlipperVM 便携版一键启动脚本(无控制台窗口)
+REM =============================================================
+setlocal
+cd /d "%~dp0"
+start "" /B "%~dp0python\pythonw.exe" "%~dp0app\main.py" %*
+endlocal
+"@ | Set-Content -Encoding ASCII "$root\FlipperVM_无控制台.bat"
+
+          # 5) embeddable Python 的路径配置 (.pth) 告诉它在哪找 app 与 site-packages
           @"
 python311.zip
 .
@@ -97,20 +190,45 @@ Lib\site-packages
 import site
 "@ | Set-Content -Encoding ASCII "$root\python\python311._pth"
 
-          # 写说明
+          # 6) 说明文件
+          $appver = python -c "from flipper_vm._version import __version__; print(__version__)"
           @"
-FlipperVM 便携版
-解压后双击 FlipperVM.bat 运行。
-详见: https://github.com/k20120509/flippervm
+========================================================
+  FlipperVM 便携版 (Windows x64)
+  版本: v$appver
+========================================================
+
+这是 FlipperVM - Flipper Zero 主板级虚拟机 的便携版。
+直接双击下面任一文件即可运行,无需安装 Python,无需配置任何环境。
+
+  双击: FlipperVM.bat            <- 带控制台(查看 UART 日志)
+  双击: FlipperVM_无控制台.bat    <- 仅图形界面
+
+* 首次使用请先阅读完整手册: app\README.md (或仓库 README.md)
+
+Release 页面还有单文件版 FlipperVM.exe 可下载,双击即运行不用解压。
+========================================================
 "@ | Set-Content -Encoding UTF8 "$root\README_FIRST.txt"
 
-          Compress-Archive -Path $root -DestinationPath "FlipperVM-portable-win64.zip" -CompressionLevel Optimal
-          Get-Item FlipperVM-portable-win64.zip | Format-List Name,Length
+          # 7) 打包 zip
+          $zip = "FlipperVM-v$appver-portable-win64.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path $root -DestinationPath $zip -CompressionLevel Optimal
+          $fi = Get-Item $zip
+          Write-Host "OK: $zip  大小 = $([math]::Round($fi.Length/1MB,1))MB"
+          "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: 上传便携包到 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          name: FlipperVM ${{ github.event.inputs.version || github.ref_name }}
-          files: FlipperVM-portable-win64.zip
-          fail_on_unmatched_files: true
+      - name: 上传便携版 zip 到 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ github.event.inputs.version }}") { "${{ github.event.inputs.version }}" } else { "${{ github.ref_name }}" }
+          Write-Host "tag = $tag , file = $env:ZIP_NAME"
+          # 若 Release 不存在才创建(一般已存在)
+          if (-not (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "FlipperVM $tag" --notes "Auto" --latest
+          }
+          # 先删旧同名资产,再上传新的
+          gh release delete-asset $tag $env:ZIP_NAME --repo $env:GITHUB_REPOSITORY --yes 2>$null || $true
+          gh release upload $tag $env:ZIP_NAME --repo $env:GITHUB_REPOSITORY --clobber
