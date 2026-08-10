@@ -1,0 +1,116 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号,如 v0.2.1"
+        required: false
+        default: "v0.2.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    name: 构建 Windows 单文件 exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm --clean flippervm.spec
+
+      - name: 检查产物
+        run: |
+          if (!(Test-Path "dist\FlipperVM.exe")) {
+            Write-Error "未找到 dist\FlipperVM.exe"
+            exit 1
+          }
+          Get-Item dist\FlipperVM.exe | Format-List Name,Length
+
+      - name: 上传 exe 到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: FlipperVM ${{ github.event.inputs.version || github.ref_name }}
+          files: dist\FlipperVM.exe
+          fail_on_unmatched_files: true
+
+  build-portable:
+    name: 构建免装便携版 zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: 下载 embeddable Python
+        shell: pwsh
+        run: |
+          $url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile python-embed.zip
+
+      - name: 组装便携包
+        shell: pwsh
+        run: |
+          $root = "dist-p\FlipperVM"
+          New-Item -ItemType Directory -Force -Path "$root\python", "$root\python\Lib\site-packages", "$root\app" | Out-Null
+          Expand-Archive -Path python-embed.zip -DestinationPath "$root\python" -Force
+          pip install --target "$root\python\Lib\site-packages" PySide6 unicorn
+
+          Copy-Item main.py -Destination "$root\app\"
+          Copy-Item flipper_vm -Recurse -Destination "$root\app\"
+          Copy-Item README.md,requirements.txt -Destination "$root\app\"
+
+          # 写启动 bat
+          @"
+@echo off
+setlocal
+cd /d "%~dp0"
+"%~dp0python\python.exe" "%~dp0app\main.py" %*
+endlocal
+"@ | Set-Content -Encoding ASCII "$root\FlipperVM.bat"
+
+          # 写 python311._pth
+          @"
+python311.zip
+.
+Lib\site-packages
+..\app
+import site
+"@ | Set-Content -Encoding ASCII "$root\python\python311._pth"
+
+          # 写说明
+          @"
+FlipperVM 便携版
+解压后双击 FlipperVM.bat 运行。
+详见: https://github.com/k20120509/flippervm
+"@ | Set-Content -Encoding UTF8 "$root\README_FIRST.txt"
+
+          Compress-Archive -Path $root -DestinationPath "FlipperVM-portable-win64.zip" -CompressionLevel Optimal
+          Get-Item FlipperVM-portable-win64.zip | Format-List Name,Length
+
+      - name: 上传便携包到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: FlipperVM ${{ github.event.inputs.version || github.ref_name }}
+          files: FlipperVM-portable-win64.zip
+          fail_on_unmatched_files: true
