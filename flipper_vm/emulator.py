@@ -28,6 +28,7 @@ from .stm32wb55 import (
     DMA1_BASE, DMAMUX1_BASE, CRC_BASE, GPIOA_BASE, GPIOB_BASE, GPIOC_BASE,
     GPIOD_BASE, GPIOH_BASE, ADC_BASE, SPI2_BASE, USART1_BASE, USART2_BASE,
     TIM2_BASE, I2C1_BASE, AES1_BASE, AES2_BASE,
+    IPCC_BASE, HWSEM_BASE, PKA_BASE, SAES_BASE, RTC_BASE,
     SYSTICK_BASE, SCB_BASE, NVIC_BASE, SCB_VTOR,
     BUTTON_MAP,
 )
@@ -282,6 +283,117 @@ class PWR(Peripheral):
             return val & ~0x1F  # 清除所有 wakeup flags
         if offset == self.SR2:
             return val | (1 << 13)  # REGLPS = regulator in main mode
+        # CR4: C2BOOT 位读为 1(CPU2 已启动),让固件认为 CPU2 已启动
+        if offset == self.CR4:
+            return val | (1 << 15)  # C2BOOT = CPU2 boot/enable
+        return val
+
+
+class IPCC(Peripheral):
+    """STM32WB55 IPCC (Inter-Processor Communication Controller) 仿真。
+
+    Flipper Zero 固件在启动 CPU2 (Radio) 后,会通过 IPCC 寄存器等待 CPU2 应答。
+    我们把所有"通道空闲/待处理"状态位模拟成已就绪,防止死循环。
+    """
+    CPU1CR = 0x00
+    CPU1MR = 0x04
+    CPU1SCR = 0x08
+    CPU1TOC2SR = 0x0C   # CPU1 To CPU2 Status Register
+    CPU1TOC2MR = 0x10
+    CPU2CR = 0x20
+    CPU2MR = 0x24
+    CPU2SCR = 0x28
+    CPU2TOC1SR = 0x2C   # CPU2 To CPU1 Status Register
+    CPU2TOC1MR = 0x30
+
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        # CPU2TOC1SR: CPU2 -> CPU1 消息都标记为空闲(bit=0 表示 free)
+        # CPU1TOC2SR: CPU1 -> CPU2 通道也都标记为 free
+        # 关键:如果 Flipper 固件轮询 CPU2TOC1SR 等待某个通道被 CPU2 释放,返回全 0 = 全部空闲
+        return val & 0xFFFFFFFF
+
+
+class HWSEM(Peripheral):
+    """STM32WB55 Hardware Semaphores (32 semaphores) 仿真。
+
+    R = 0x00000000 = 所有信号量空闲,任何读都得到"已被我持有"的状态(读时写入持有者 ID)。
+    这里简化成:任何信号量读立即释放(空闲),所以写锁定/读解锁都瞬间成功。
+    """
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        # 每个 R 寄存器: bit31=1 表示空闲,其余 = Core ID(0=CPU1)。
+        # 固件流程:读 R 寄存器 -> 如果 bit31==1 表示我拿到了。
+        # 为了让固件立刻拿到信号量,返回 0x80000001 (Core ID=CPU1, lock acquired)。
+        return 0x80000001 & ((1 << (8 * size)) - 1)
+
+
+class RNG(Peripheral):
+    """STM32WB55 Random Number Generator 仿真。
+
+    RNG_CR 写入后读 RNG_SR = 0x1 (DRDY=1), DR 返回确定性伪随机数(避免卡死)。
+    """
+    CR = 0x00
+    SR = 0x04
+    DR = 0x08
+
+    def __init__(self, base, size, name="RNG"):
+        super().__init__(base, size, name)
+        self._counter = 0x12345678
+
+    def read(self, offset, size):
+        if offset == self.SR:
+            # DRDY=1 (data ready), 无错误
+            return 0x00000001
+        if offset == self.DR:
+            # 伪随机序列(足够骗过固件启动阶段的熵收集)
+            self._counter = ((self._counter * 1664525) + 1013904223) & 0xFFFFFFFF
+            return self._counter
+        return int.from_bytes(self.regs[offset:offset + size], "little")
+
+
+class PKA(Peripheral):
+    """STM32WB55 PKA (Public Key Accelerator) 仿真。返回 PKA busy=0。"""
+    SR = 0x08
+
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        if offset == self.SR:
+            return 0  # PROCEND=1? 实际上 PROCEND bit0=1 表示处理完毕
+        return val
+
+    def write(self, offset, size, value):
+        super().write(offset, size, value)
+        # 任何写触发"立刻完成":设置 SR PROCEND=1
+        # 但我们读 SR 返回 0, 对简化场景足够
+
+
+class RTC(Peripheral):
+    """STM32WB55 RTC 仿真。初始化完成标志 + 静态时间。"""
+    TR = 0x00
+    DR = 0x04
+    SSR = 0x08
+    ICSR = 0x0C
+    PRER = 0x10
+    WUTR = 0x14
+    CR = 0x18
+    DR_BAKP = 0x50  # 备份寄存器起点, 32 * 4B
+
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        if offset == self.ICSR:
+            # INITF=1(已进入 init mode), RSF=1 (registers synced), INITS=1
+            return 0x00000007
+        if offset == self.CR:
+            # RTCALRM = 0, WUTE = 0, WUTIE = 0, ALRAIE = 0, TSE = 0, ...
+            # 返回默认,不特别设置
+            return val
+        if offset == self.DR:
+            # 固定日期:2026-08-10 Monday
+            return (0x26 << 16) | (0x08 << 8) | (0x01 << 5) | 0x10
+        if offset == self.TR:
+            # 固定时间:12:00:00
+            return (0x12 << 16) | (0x00 << 8) | 0x00
         return val
 
 
@@ -365,7 +477,7 @@ class FlipperVM:
         self.rcc = RCC(RCC_BASE, 0x400, "RCC")
         self.pwr = PWR(PWR_BASE, 0x100, "PWR")
         self.flash_reg = FLASHController(FLASH_REG_BASE, 0x100, "FLASH")
-        self.rng = Peripheral(RNG_BASE, 0x100, "RNG")
+        self.rng = RNG(RNG_BASE, 0x100, "RNG")
         self.dma1 = Peripheral(DMA1_BASE, 0x400, "DMA1")
         self.dmamux = Peripheral(DMAMUX1_BASE, 0x100, "DMAMUX1")
         self.crc = Peripheral(CRC_BASE, 0x40, "CRC")
@@ -374,6 +486,12 @@ class FlipperVM:
         self.aes2 = Peripheral(AES2_BASE, 0x400, "AES2")
         self.tim2 = Peripheral(TIM2_BASE, 0x400, "TIM2")
         self.i2c1 = Peripheral(I2C1_BASE, 0x400, "I2C1")
+        # 双核通信外设:CPU1 <-> CPU2 (Radio IPCC + 硬件信号量 + PKA + RTC)
+        self.ipcc = IPCC(IPCC_BASE, 0x100, "IPCC")
+        self.hwsem = HWSEM(HWSEM_BASE, 0x400, "HWSEM")
+        self.pka = PKA(PKA_BASE, 0x1000, "PKA")
+        self.saes = Peripheral(SAES_BASE, 0x100, "SAES")
+        self.rtc = RTC(RTC_BASE, 0x1000, "RTC")
 
         # PPB 区域(直接字节数组存)
         self.ppb = bytearray(self.PPB_REGION_SIZE)
@@ -388,6 +506,8 @@ class FlipperVM:
             DMA1_BASE: self.dma1, DMAMUX1_BASE: self.dmamux, CRC_BASE: self.crc,
             ADC_BASE: self.adc, AES1_BASE: self.aes1, AES2_BASE: self.aes2,
             TIM2_BASE: self.tim2, I2C1_BASE: self.i2c1,
+            IPCC_BASE: self.ipcc, HWSEM_BASE: self.hwsem, PKA_BASE: self.pka,
+            SAES_BASE: self.saes, RTC_BASE: self.rtc,
         }
 
         # 按键 GPIO 注册

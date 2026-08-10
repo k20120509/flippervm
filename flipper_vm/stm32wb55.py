@@ -55,11 +55,18 @@ GPIOH_BASE = 0x48001C00
 ADC_BASE = 0x50040000
 
 # AHB3
-RCC_BASE = 0x58000000
+RCC_BASE       = 0x58000000
+IPCC_BASE      = 0x58000C00  # CPU1 <-> CPU2 通信控制器
 FLASH_REG_BASE = 0x58004000  # FLASH 控制寄存器
-RNG_BASE = 0x58001000
-AES1_BASE = 0x58001100
-AES2_BASE = 0x58001200
+RNG_BASE       = 0x58001000  # 真随机数发生器
+AES1_BASE      = 0x58001100
+AES2_BASE      = 0x58001200
+HWSEM_BASE     = 0x58001400  # 硬件信号量 (32 个)
+PKA_BASE       = 0x58002000  # 公钥加速器
+SAES_BASE      = 0x58002800
+# RTC 使用独立地址(真实 0x58004000 与 FLASH_REG 复用空间,这里偏移到安全位置,防止地址冲突)
+RTC_BASE       = 0x58005000
+# PWR 在 APB1 = 0x40007000, PWR_CR4.C2BOOT 位控制 CPU2 启动
 
 # ===== Flipper Zero 按键 → GPIO 映射 =====
 # 与 furi_hal_resources 中的 BUTTON_* 引脚一致

@@ -235,6 +235,12 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.instructions_per_frame = 50000
 
+        # 卡死检测:记录最近 64 次 tick 的 (PC, icount), 如果 PC 在很小范围内跳变
+        # (例如同一条 B . 或一个 while 循环 2~3 条指令)且 icount 增长过慢 10 秒
+        # -> 报警 "卡死" 并输出函数名
+        self._stuck_pc_window = []   # list of (pc, icount, ts_ms)
+        self._stuck_warned_pc = None   # 已报警过的 PC,避免刷屏
+
     # ---------- 固件 ----------
     def _load_firmware(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -304,6 +310,27 @@ class MainWindow(QMainWindow):
             self.display.update()
             self.vm.display.clear_dirty()
         self._refresh_status()
+        # 卡死检测
+        import time
+        pc = self.vm.uc.reg_read(UC_ARM_REG_PC)
+        self._stuck_pc_window.append((pc, self.vm.icount, int(time.monotonic() * 1000)))
+        if len(self._stuck_pc_window) > 64:
+            self._stuck_pc_window.pop(0)
+        if len(self._stuck_pc_window) >= 32:
+            first_pc, first_ic, first_ts = self._stuck_pc_window[0]
+            last_pc, last_ic, last_ts = self._stuck_pc_window[-1]
+            if (last_ts - first_ts) > 8000 and (last_ic - first_ic) < 200 * len(self._stuck_pc_window):
+                # 8 秒内 icount 增长低于 ~200 条/tick => 疑似死循环
+                pcs = {p for p, _, _ in self._stuck_pc_window}
+                min_pc, max_pc = min(pcs), max(pcs)
+                # 只对同一块卡死区域报警一次,避免满屏警告
+                if self._stuck_warned_pc != min_pc:
+                    self._stuck_warned_pc = min_pc
+                    self.console.appendPlainText(
+                        f"[WARN] ⚠️ 可能卡死: PC 在 0x{min_pc:08X}..0x{max_pc:08X} 循环 8s 以上, "
+                        f"涉及 {len(pcs)} 条指令。\n"
+                        f"[WARN]   可能是:等待某个未仿真的外设就绪 / Flash 等待 CPU2 / 中断未响应。\n"
+                        f"[WARN]   请把 UART 日志贴给开发者,以便补全仿真。")
 
     def _on_speed(self, v: int):
         self.instructions_per_frame = v * 5000
