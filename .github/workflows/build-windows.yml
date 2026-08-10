@@ -14,13 +14,16 @@ on:
 permissions:
   contents: write
 
-# 避免多个 job 同时写同一个 Release 竞态
+# 串行化同一个 tag 的 release 上传,避免两个 job 同时写 Release 竞态。
+# 注意:concurrency.group 顶层不允许复杂的表达式或默认值回退,
+# 因此只用 github.ref_name (tag 名 或 分支名) 做区分即可。
 concurrency:
-  group: release-assets-${{ github.event.inputs.version || github.ref_name }}
+  group: release-assets-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   PYVER: "3.11"
+  APP_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
 
 jobs:
   # -------- Job 1: 构建单文件 exe,并上传到已有 Release --------
@@ -75,10 +78,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = if ("${{ github.event.inputs.version }}") { "${{ github.event.inputs.version }}" } else { "${{ github.ref_name }}" }
+          $tag = "${{ env.APP_TAG }}"
           Write-Host "tag = $tag"
           Write-Host "APP_VERSION (from _version.py) = $env:APP_VERSION"
-          # 若 Release 还不存在,先创建(softprops 之外的兜底,本仓库通常先由人手动创建)
+          # 若 Release 还不存在,先创建(本仓库通常先由人手动创建)
           if (-not (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY --title "FlipperVM $tag" --notes "Automatically created by CI" --latest
           }
@@ -223,7 +226,7 @@ Release 页面还有单文件版 FlipperVM.exe 可下载,双击即运行不用�
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = if ("${{ github.event.inputs.version }}") { "${{ github.event.inputs.version }}" } else { "${{ github.ref_name }}" }
+          $tag = "${{ env.APP_TAG }}"
           Write-Host "tag = $tag , file = $env:ZIP_NAME"
           # 若 Release 不存在才创建(一般已存在)
           if (-not (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
