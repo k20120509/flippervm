@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec:打包 FlipperVM 为单文件 Windows exe.
 版本号单一事实源: flipper_vm/_version.py
+注意:
+  - 本文件被 PyInstaller exec() 执行,默认 __file__ 不可用,
+    必须使用 PyInstaller 注入的 SPECPATH 全局变量。
 """
 from PyInstaller.utils.hooks import collect_all
-import os, sys, struct
+import os
+import sys
 
 # ============ 版本号:从 _version.py 读取,同时生成 VersionInfo ============
-sys.path.insert(0, os.getcwd())
+sys.path.insert(0, SPECPATH)
 from flipper_vm._version import __version__, APP_NAME
 
 _major, _minor, _patch = (int(x) for x in __version__.split('.'))
@@ -41,7 +45,7 @@ VSVersionInfo(
   ]
 )
 """
-_version_info_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build_version_info.txt')
+_version_info_path = os.path.join(SPECPATH, 'build_version_info.txt')
 with open(_version_info_path, 'w', encoding='utf-8') as f:
     f.write(_version_info_content)
 
