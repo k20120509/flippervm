@@ -206,6 +206,85 @@ class USART(Peripheral):
         super().write(offset, size, value)
 
 
+class RCC(Peripheral):
+    """STM32WB55 RCC (Reset and Clock Control) 仿真。
+
+    关键:所有时钟就绪标志位返回 1,否则固件会死循环等待时钟就绪。
+    """
+    CR      = 0x00   # Clock control register
+    ICSCR  = 0x04   # Internal clock sources calibration
+    CFGR    = 0x08   # Clock configuration register
+    CSR     = 0x94   # Clock control & status register
+    CRRCR   = 0x98   # Clock recovery RC register
+    CRRCR_48RDY = 1 << 1   # HSI48 ready
+    HSERDY  = 1 << 9   # HSE ready (Flipper uses external crystal)
+    HSIRDY  = 1 << 0   # HSI ready
+    HSIKERDY = 1 << 7  # HSI kernel ready
+    PLLRDY  = 1 << 25  # PLL ready
+
+    def __init__(self, base, size, name="RCC"):
+        super().__init__(base, size, name)
+
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        if offset == self.CR or (offset <= self.CR + 4 and offset + size > self.CR):
+            # 读 CR:强制所有就绪标志位为 1
+            val = int.from_bytes(self.regs[0:4], "little")
+            val |= self.HSIRDY | self.HSIKERDY | self.HSERDY | self.PLLRDY
+            if size == 4:
+                return val
+            elif size == 2:
+                return val & 0xFFFF
+            else:
+                return val & 0xFF
+        if offset == self.CRRCR:
+            return val | self.CRRCR_48RDY
+        # CFGR: 返回当前系统时钟源为 PLL (SWS=0b10)
+        if offset == self.CFGR:
+            val = int.from_bytes(self.regs[self.CFGR:self.CFGR + 4], "little")
+            val |= (0b10 << 2)  # SWS = PLL
+            if size == 4:
+                return val
+            elif size == 2:
+                return val & 0xFFFF
+            else:
+                return val & 0xFF
+        return val
+
+
+class FLASHController(Peripheral):
+    """STM32WB55 FLASH 控制寄存器仿真。"""
+    ACR = 0x00  # Access control register
+
+    def read(self, offset, size):
+        if offset == self.ACR:
+            # 返回合理的 latency: Flash 已就绪
+            val = int.from_bytes(self.regs[0:4], "little")
+            val |= (1 << 0)  # Latency bits (1 wait state)
+            return val & 0xFFFFFFFF
+        return super().read(offset, size)
+
+
+class PWR(Peripheral):
+    """STM32WB55 PWR (Power Control) 仿真。"""
+    SR1 = 0x00
+    SR2 = 0x04
+    CR1 = 0x00
+    CR2 = 0x04
+    CR3 = 0x08
+    CR4 = 0x0C
+    CR5 = 0x10
+
+    def read(self, offset, size):
+        val = int.from_bytes(self.regs[offset:offset + size], "little")
+        # SR1: 所有就绪标志位返回 1 (WUF, SBF, etc. cleared = ready)
+        if offset == self.SR1:
+            return val & ~0x1F  # 清除所有 wakeup flags
+        if offset == self.SR2:
+            return val | (1 << 13)  # REGLPS = regulator in main mode
+        return val
+
+
 class ST7567DisplayAdapter:
     """把 ST7567 包装成有 framebuffer 接口的对象。"""
     def __init__(self):
@@ -283,9 +362,9 @@ class FlipperVM:
         self.usart1 = USART(USART1_BASE, "USART1", on_uart_tx)
         self.usart2 = USART(USART2_BASE, "USART2", on_uart_tx)
         self.exti = Peripheral(EXTI_BASE, 0x80, "EXTI")
-        self.rcc = Peripheral(RCC_BASE, 0x400, "RCC")
-        self.pwr = Peripheral(PWR_BASE, 0x100, "PWR")
-        self.flash_reg = Peripheral(FLASH_REG_BASE, 0x100, "FLASH")
+        self.rcc = RCC(RCC_BASE, 0x400, "RCC")
+        self.pwr = PWR(PWR_BASE, 0x100, "PWR")
+        self.flash_reg = FLASHController(FLASH_REG_BASE, 0x100, "FLASH")
         self.rng = Peripheral(RNG_BASE, 0x100, "RNG")
         self.dma1 = Peripheral(DMA1_BASE, 0x400, "DMA1")
         self.dmamux = Peripheral(DMAMUX1_BASE, 0x100, "DMAMUX1")
@@ -366,8 +445,95 @@ class FlipperVM:
         self.gpiob.write(self.gpiob.ODR, 4, 0)
         self.gpioc.write(self.gpioc.ODR, 4, (1 << 9))
         # 为了兼容"固件未发 0xAF 开屏命令"的情况,默认强制打开显示
-        # (真正的 Flipper Zero 启动时 LCD 本来就是亮的,固件会在初始化序列里再写 0xAF)
         self.display.turn_on()
+
+        # 在屏幕上显示固件加载信息,让用户立刻看到屏幕有内容
+        # 固件执行后写 LCD 时会覆盖这些内容
+        self._paint_boot_screen(fw)
+
+        # 通过 UART 输出加载信息
+        if self.on_uart_tx:
+            msg = f"\r\n[FlipperVM] Firmware loaded: {len(fw.data)} bytes\r\n"
+            msg += f"[FlipperVM] SP=0x{fw.initial_sp:08X} PC=0x{fw.entry_point:08X}\r\n"
+            msg += f"[FlipperVM] Press RUN to start execution\r\n"
+            for ch in msg:
+                self.on_uart_tx(ord(ch))
+
+    # ---------- 启动画面 ----------
+    _BOOT_FONT = {
+        'A': ["01110","10001","10001","11111","10001","10001","10001"],
+        'B': ["11110","10001","10001","11110","10001","10001","11110"],
+        'C': ["01111","10000","10000","10000","10000","10000","01111"],
+        'D': ["11110","10001","10001","10001","10001","10001","11110"],
+        'E': ["11111","10000","10000","11110","10000","10000","11111"],
+        'F': ["11111","10000","10000","11110","10000","10000","10000"],
+        'G': ["01111","10000","10000","10111","10001","10001","01111"],
+        'H': ["10001","10001","10001","11111","10001","10001","10001"],
+        'I': ["01110","00100","00100","00100","00100","00100","01110"],
+        'K': ["10001","10010","10100","11000","10100","10010","10001"],
+        'L': ["10000","10000","10000","10000","10000","10000","11111"],
+        'M': ["10001","11011","10101","10101","10001","10001","10001"],
+        'N': ["10001","11001","10101","10011","10001","10001","10001"],
+        'O': ["01110","10001","10001","10001","10001","10001","01110"],
+        'P': ["11110","10001","10001","11110","10000","10000","10000"],
+        'R': ["11110","10001","10001","11110","10100","10010","10001"],
+        'S': ["01111","10000","10000","01110","00001","00001","11110"],
+        'T': ["11111","00100","00100","00100","00100","00100","00100"],
+        'U': ["10001","10001","10001","10001","10001","10001","01110"],
+        'V': ["10001","10001","10001","10001","10001","01010","00100"],
+        'W': ["10001","10001","10001","10101","10101","10101","01010"],
+        'X': ["10001","10001","01010","00100","01010","10001","10001"],
+        'Y': ["10001","10001","10001","01010","00100","00100","00100"],
+        'Z': ["11111","00001","00010","00100","01000","10000","11111"],
+        '0': ["01110","10001","10011","10101","11001","10001","01110"],
+        '1': ["00100","01100","00100","00100","00100","00100","01110"],
+        '2': ["01110","10001","00001","00010","00100","01000","11111"],
+        '3': ["11110","00001","00001","01110","00001","00001","11110"],
+        '4': ["00010","00110","01010","10010","11111","00010","00010"],
+        '5': ["11111","10000","11110","00001","00001","10001","01110"],
+        '6': ["00110","01000","10000","11110","10001","10001","01110"],
+        '7': ["11111","00001","00010","00100","01000","01000","01000"],
+        '8': ["01110","10001","10001","01110","10001","10001","01110"],
+        '9': ["01110","10001","10001","01111","00001","00010","01100"],
+        ' ': ["00000","00000","00000","00000","00000","00000","00000"],
+        ':': ["00000","00100","00000","00000","00000","00100","00000"],
+        '.': ["00000","00000","00000","00000","00000","00000","00100"],
+        '!': ["00100","00100","00100","00100","00100","00000","00100"],
+        '-': ["00000","00000","00000","11111","00000","00000","00000"],
+        '/': ["00001","00010","00010","00100","01000","01000","10000"],
+        'x': ["00000","00000","10001","01010","00100","01010","10001"],
+    }
+
+    def _paint_boot_screen(self, fw: FirmwareImage) -> None:
+        """在 LCD 上画启动信息,让用户立刻看到屏幕有内容。"""
+        d = self.display
+        d.clear()
+        W, H = d.width, d.height
+        # 画边框
+        for x in range(W):
+            d.set_pixel(x, 0, 1)
+            d.set_pixel(x, H - 1, 1)
+        for y in range(H):
+            d.set_pixel(0, y, 1)
+            d.set_pixel(W - 1, y, 1)
+
+        font = self._BOOT_FONT
+        def draw_text(x, y, text):
+            px = x
+            for ch in text.upper():
+                glyph = font.get(ch, font[' '])
+                for gy, row in enumerate(glyph):
+                    for gx, bit in enumerate(row):
+                        if bit == '1' and 0 <= px+gx < W and 0 <= y+gy < H:
+                            d.set_pixel(px + gx, y + gy, 1)
+                px += 6
+
+        size_kb = len(fw.data) // 1024
+        draw_text(4, 4, "FlipperVM")
+        draw_text(4, 16, f"FW {size_kb}KB")
+        draw_text(4, 28, f"SP {fw.initial_sp:08X}")
+        draw_text(4, 40, f"PC {fw.entry_point:08X}")
+        draw_text(4, 52, "PRESS RUN")
 
     # ---------- 按键 ----------
     def set_button(self, name: str, pressed: bool) -> None:
@@ -391,6 +557,12 @@ class FlipperVM:
             self.uc.emu_start(begin, 0, timeout=0, count=n_instructions)
         except Exception as e:
             self.running = False
+            # 通过 UART 报告异常位置,方便用户排查
+            if self.on_uart_tx:
+                pc = self.uc.reg_read(UC_ARM_REG_PC)
+                msg = f"\r\n[FlipperVM] CPU exception: {e}\r\n[FlipperVM] PC=0x{pc:08X}\r\n"
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
             raise
         # 累加指令计数(不再依赖 _hook_code)
         self.icount += n_instructions
