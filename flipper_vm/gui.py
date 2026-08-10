@@ -133,7 +133,8 @@ class ConsoleWidget(QPlainTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FlipperVM — Flipper Zero 主板级虚拟机")
+        from flipper_vm._version import APP_TITLE
+        self.setWindowTitle(APP_TITLE)
         self.resize(900, 640)
 
         self.vm = FlipperVM(on_uart_tx=self._on_uart_byte)

@@ -1,8 +1,51 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec:打包 FlipperVM 为单文件 Windows exe."""
+"""PyInstaller spec:打包 FlipperVM 为单文件 Windows exe.
+版本号单一事实源: flipper_vm/_version.py
+"""
 from PyInstaller.utils.hooks import collect_all
+import os, sys, struct
 
-# 收集 PySide6 与 unicorn 的全部数据/二进制/隐藏导入
+# ============ 版本号:从 _version.py 读取,同时生成 VersionInfo ============
+sys.path.insert(0, os.getcwd())
+from flipper_vm._version import __version__, APP_NAME
+
+_major, _minor, _patch = (int(x) for x in __version__.split('.'))
+
+# 生成 Windows 版本资源(filevers/prodvers + CompanyName/ProductName/FileDescription)
+_version_info_content = f"""
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({_major}, {_minor}, {_patch}, 0),
+    prodvers=({_major}, {_minor}, {_patch}, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('080404B0', [
+        StringStruct('CompanyName', 'k20120509'),
+        StringStruct('FileDescription', 'FlipperVM - Flipper Zero 主板级虚拟机'),
+        StringStruct('FileVersion', '{__version__}'),
+        StringStruct('InternalName', 'FlipperVM'),
+        StringStruct('LegalCopyright', 'MIT License. (c) 2026 k20120509'),
+        StringStruct('OriginalFilename', 'FlipperVM.exe'),
+        StringStruct('ProductName', 'FlipperVM'),
+        StringStruct('ProductVersion', '{__version__}'),
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
+"""
+_version_info_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build_version_info.txt')
+with open(_version_info_path, 'w', encoding='utf-8') as f:
+    f.write(_version_info_content)
+
+# ============ 收集依赖 ============
 datas = []
 binaries = []
 hiddenimports = []
@@ -13,8 +56,7 @@ for pkg in ('PySide6', 'unicorn'):
     binaries += b
     hiddenimports += h
 
-# unicorn 的 native 库必须确保被收集
-hiddenimports += ['unicorn.lib', 'unicorn.unicorn']
+hiddenimports += ['unicorn.lib', 'unicorn.unicorn', 'flipper_vm._version']
 
 a = Analysis(
     ['main.py'],
@@ -25,7 +67,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'pytest', 'unittest'],
+    excludes=['tkinter', 'pytest', 'unittest', 'capstone', 'keystone'],
     noarchive=False,
 )
 
@@ -44,10 +86,11 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,           # 保留控制台以便看 UART 输出与异常
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=_version_info_path,
 )
