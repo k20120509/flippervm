@@ -1,5 +1,10 @@
 # 🐬 FlipperVM — Flipper Zero 虚拟机用户手册
 
+
+**发现 bug、想加外设、提建议?** 欢迎来 https://github.com/k20120509/flippervm/issues 开 Issue。
+
+
+
 > **一句话理解**:把 Flipper Zero 的固件放进本软件,你就能在 Windows 电脑上**像用真机一样用 Flipper Zero**,不用花钱买硬件也能体验它的界面和功能。
 >
 > 本软件是**主板级虚拟机**:不只是 UI 模仿,而是用 [Unicorn Engine] 真实执行 STM32WB55 的每一条 ARM 指令,加载任何官方/第三方固件,屏幕显示和按键逻辑都与真机完全一致。
@@ -294,4 +299,3 @@ MIT License — 详见 [LICENSE](LICENSE)。
 
 ---
 
-**发现 bug、想加外设、提建议?** 欢迎来 https://github.com/k20120509/flippervm/issues 开 Issue。
