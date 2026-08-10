@@ -107,9 +107,9 @@ jobs:
       - name: Assemble portable package
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $root = 'out-p\FlipperVM'
-          New-Item -ItemType Directory -Force -Path `
-            "$root\python", "$root\python\Lib\site-packages", "$root\app" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root\python", "$root\python\Lib\site-packages", "$root\app" | Out-Null
           Expand-Archive -Path python-embed.zip -DestinationPath "$root\python" -Force
           python -m pip install --upgrade --target "$root\python\Lib\site-packages" PySide6 unicorn
           Get-ChildItem "$root\python\Lib\site-packages" -Recurse -Directory -Filter __pycache__ |
@@ -119,35 +119,60 @@ jobs:
           Copy-Item flipper_vm -Recurse -Destination "$root\app\"
           Copy-Item README.md, requirements.txt -Destination "$root\app\"
 
+          # ---------- 写文件工具函数 ----------
+          function Write-Text($path, [string[]]$lines, $enc = 'ASCII') {
+            [System.IO.File]::WriteAllLines($path, $lines, [System.Text.Encoding]::$enc)
+          }
+
           # Launcher bat (with console)
-          @"
-@echo off
-setlocal
-cd /d "%~dp0"
-if not exist "app\main.py" ( echo [ERROR] app\main.py not found & pause & exit /b 1 )
-if exist "python\python.exe" ( "%~dp0python\python.exe" "%~dp0app\main.py" %* ) else ( echo [ERROR] python\python.exe not found & pause & exit /b 1 )
-endlocal
-"@ | Set-Content -Encoding ASCII "$root\FlipperVM.bat"
+          $bat1 = @(
+            'echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'if not exist "app\main.py" ( echo [ERROR] app\main.py not found & pause & exit /b 1 )',
+            'if exist "python\python.exe" ( "%~dp0python\python.exe" "%~dp0app\main.py" %* ) else ( echo [ERROR] python\python.exe not found & pause & exit /b 1 )',
+            'endlocal'
+          )
+          Write-Text "$root\FlipperVM.bat" $bat1
 
           # Launcher bat (no console)
-          @"
-@echo off
-setlocal
-cd /d "%~dp0"
-start "" /B "%~dp0python\pythonw.exe" "%~dp0app\main.py" %*
-endlocal
-"@ | Set-Content -Encoding ASCII "$root\FlipperVM_无控制台.bat"
+          $bat2 = @(
+            'echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'start "" /B "%~dp0python\pythonw.exe" "%~dp0app\main.py" %*',
+            'endlocal'
+          )
+          Write-Text "$root\FlipperVM_无控制台.bat" $bat2
 
           # Embeddable python .pth (site-packages + app on sys.path)
-          @"
-python311.zip
-.
-Lib\site-packages
-..\app
-import site
-"@ | Set-Content -Encoding ASCII "$root\python\python311._pth"
+          $pth = @(
+            'python311.zip',
+            '.',
+            'Lib\site-packages',
+            '..\app',
+            'import site'
+          )
+          Write-Text "$root\python\python311._pth" $pth
 
           $appver = python -c "from flipper_vm._version import __version__; print(__version__)"
+          # README_FIRST (UTF8)
+          $readme = @(
+            '========================================================',
+            "  FlipperVM Portable Edition (Windows x64)  v$appver",
+            '========================================================',
+            '',
+            'Unzip this folder, then double-click either:',
+            '   .\FlipperVM.bat            (with console log)',
+            '   .\FlipperVM_无控制台.bat   (GUI only)',
+            '',
+            'No Python / VC++ / any install needed - fully portable.',
+            '',
+            'Full manual: app\README.md or https://github.com/k20120509/flippervm',
+            '========================================================'
+          )
+          Write-Text "$root\README_FIRST.txt" $readme UTF8
+
           $zip = "FlipperVM-v$appver-portable-win64.zip"
           if (Test-Path $zip) { Remove-Item -Force $zip }
           Compress-Archive -Path $root -DestinationPath $zip -CompressionLevel Optimal
