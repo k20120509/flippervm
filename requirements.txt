@@ -1,0 +1,2 @@
+PySide6>=6.6.0
+unicorn>=2.0.1.post7
