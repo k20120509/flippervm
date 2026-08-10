@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 from unicorn import (
     Uc, UC_ARCH_ARM, UC_MODE_MCLASS, UC_MODE_THUMB,
-    UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
+    UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
     UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED,
     UC_HOOK_INTR, UC_ERR_OK, UC_PROT_ALL,
 )
@@ -314,8 +314,9 @@ class FlipperVM:
                          end=self.PPB_REGION_BASE + self.PPB_REGION_SIZE - 1)
         self.uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED, self._hook_unmapped)
         self.uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, self._hook_unmapped)
-        self.uc.hook_add(UC_HOOK_CODE, self._hook_code)
         self.uc.hook_add(UC_HOOK_INTR, self._hook_intr)
+        # 注意:不再注册 UC_HOOK_CODE(_hook_code 性能极差,每条指令回调 Python)
+        # icount 通过 step(count=N) 的 N 累加估算
 
     # ---------- 固件加载 ----------
     def load_firmware(self, fw: FirmwareImage) -> None:
@@ -355,6 +356,8 @@ class FlipperVM:
         except Exception as e:
             self.running = False
             raise
+        # 累加指令计数(不再依赖 _hook_code)
+        self.icount += n_instructions
         # 检查 SysTick 是否到期
         if (self.systick_ctrl & 0x1) and self.systick_load:
             self.systick_countdown -= n_instructions
@@ -371,7 +374,8 @@ class FlipperVM:
         vtor = int.from_bytes(self.ppb[SCB_VTOR - PPB_BASE:SCB_VTOR - PPB_BASE + 4], "little")
         tbl_off = exception * 4
         val = int.from_bytes(self.uc.mem_read(vtor + tbl_off, 4), "little")
-        return val & 0xFFFFFFFE  # Thumb 地址清 bit0
+        # 保留 Thumb 位(bit0=1),否则 unicorn 当 ARM 解码
+        return val | 1
 
     def _fire_exception(self, exception: int) -> None:
         """手动进入异常:压栈 8 字,设置 LR=EXC_RETURN,PC=向量。"""
@@ -411,7 +415,8 @@ class FlipperVM:
         self.uc.reg_write(UC_ARM_REG_R3, r3)
         self.uc.reg_write(UC_ARM_REG_R12, r12)
         self.uc.reg_write(UC_ARM_REG_LR, lr)
-        self.uc.reg_write(UC_ARM_REG_PC, pc & 0xFFFFFFFE)
+        # Cortex-M:返回 PC 必须保留 Thumb 位(bit0=1),否则 unicorn 当 ARM 解码
+        self.uc.reg_write(UC_ARM_REG_PC, pc | 1)
         self.uc.reg_write(UC_ARM_REG_XPSR, xpsr & 0xF8000000 | (1 << 24))
         self.uc.reg_write(UC_ARM_REG_SP, sp + 32)
         if self.in_handler > 0:
@@ -556,15 +561,14 @@ class FlipperVM:
         except Exception:
             return False
 
-    # ---------- 代码钩子 ----------
-    def _hook_code(self, uc, address, size, user_data):
-        self.icount += 1
-
     # ---------- 中断钩子(主要处理 EXC_RETURN)----------
     def _hook_intr(self, uc, intno, user_data):
-        # intno 在 Cortex-M 上为 EXC_RETURN 值时表示从异常返回
-        if intno & 0xFF000000 == 0xFF000000:
-            self._return_from_exception(intno)
-        else:
-            # 真正的硬件异常(NMI/HardFault 等):默认 fire
-            self._fire_exception(intno & 0x1FF)
+        lr = uc.reg_read(UC_ARM_REG_LR)
+        # LR 是 EXC_RETURN 值 → 当前是从异常返回(我们的手动 handler 里 BX LR 触发)
+        if lr & 0xFF000000 == 0xFF000000:
+            self._return_from_exception(lr)
+            return
+        # unicorn 内置 HardFault(intno=2/3):通常因为非法内存访问或指令错误
+        # 这里只记录,不再递归 fire(避免无限 HardFault 循环)
+        # 真实固件遇到这种情况说明外设仿真有缺漏,交给上层看 UART 输出排查
+        return
