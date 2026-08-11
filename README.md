@@ -76,10 +76,13 @@ FlipperVM 需要一个「Flipper Zero 的操作系统固件」才能工作。就
 | **Momentum**(第三方) | https://github.com/Next-Flip/Momentum-Firmware/releases | 功能多 |
 | **Unleashed**(第三方) | https://github.com/DarkFlippers/unleashed-firmware/releases | 定制强 |
 | **本仓库自带演示固件** | [`firmware_files/demo_firmware.bin`](firmware_files/demo_firmware.bin) | ✅ 验证 VM 是否正常 |
+| **本仓库自带真实固件** | [`firmware_files/momentum-fw-v1.1.5.dfu`](firmware_files/momentum-fw-v1.1.5.dfu) | ✅ Momentum v1.1.5 中文版 |
 
 下载后的固件文件格式是 `.dfu` 或 `.bin`,两种都支持。
 
-> 💡 **想先验证 FlipperVM 能不能跑?** 仓库里自带了一个 64 KB 的 `demo_firmware.bin`(位于 `firmware_files/` 目录)。它是个合成的最小启动固件,会走完 Flipper 的启动流程(RCC/FLASH/PWR/FreeRTOS/BT/GUI),在 LCD 上绘制测试图案,并通过 UART 输出 `FIRMWARE_BOOTED dolphin`。加载它点「运行」就能立刻看到效果,无需下载真实固件。
+> 💡 **想先验证 FlipperVM 能不能跑?** 仓库里自带了两个固件,位于 `firmware_files/` 目录:
+> - `demo_firmware.bin`(64 KB)— 合成的最小启动固件,走完 Flipper 启动流程(RCC/FLASH/PWR/FreeRTOS/BT/GUI),在 LCD 上绘制「FlipperVM」文字 + 海豚图案,通过 UART 输出 `FIRMWARE_BOOTED dolphin`。加载它点「运行」就能立刻看到效果。
+> - `momentum-fw-v1.1.5.dfu`(848 KB)— 真实的 Momentum v1.1.5 中文版固件,可加载并执行启动流程(因外设未完整仿真,可能无法进入主菜单)。
 
 > 📝 找对文件:在官方 Release 的 Assets 里,找 `flipper-z-f7-update-*.dfu`(Flipper 的主固件),不要下成 `any-remote-storage-update` 这种。
 

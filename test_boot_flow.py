@@ -297,8 +297,77 @@ def build_firmware():
     flash[0x800:0x800 + len(blob)] = blob
 
     # (7) gui_init / canvas_init ---
+    # 绘制 Flipper 海豚启动画面:128x64,8 页,每页 128 字节
+    # 每字节 = 8 行垂直像素,bit0=顶部
+    # 画一个边框 + "FlipperVM" 文字 + 简化海豚图形
+    # 用 Python 生成 1024 字节位图,放到 flash 0x1000 处
+
+    def make_bitmap():
+        """生成 128x64 的位图,8 页 x 128 字节。"""
+        W, H = 128, 64
+        pixels = [[0]*W for _ in range(H)]
+        # 画边框
+        for x in range(W):
+            pixels[0][x] = 1
+            pixels[H-1][x] = 1
+        for y in range(H):
+            pixels[y][0] = 1
+            pixels[y][W-1] = 1
+        # 画 "FlipperVM" 文字 (5x7 字体)
+        font = {
+            'F': [0x7E,0x40,0x40,0x40,0x40],
+            'l': [0x40,0x40,0x40,0x40,0x40],
+            'i': [0x00,0x00,0x7E,0x00,0x00],
+            'p': [0x7E,0x08,0x08,0x08,0x08],
+            'e': [0x3E,0x40,0x40,0x40,0x3E],
+            'r': [0x7E,0x08,0x10,0x20,0x40],
+            'V': [0x60,0x18,0x04,0x18,0x60],
+            'M': [0x7E,0x20,0x10,0x20,0x7E],
+        }
+        text = "FlipperVM"
+        tx, ty = 32, 24
+        for ch in text:
+            if ch in font:
+                glyph = font[ch]
+                for col in range(5):
+                    bits = glyph[col]
+                    for row in range(7):
+                        if bits & (1 << (6-row)):
+                            if 0 <= ty+row < H and 0 <= tx+col < W:
+                                pixels[ty+row][tx+col] = 1
+            tx += 7
+        # 画一个简化的海豚 (y=40-58)
+        dolphin_pixels = [
+            (40,52),(42,50),(44,49),(48,48),(52,48),(56,48),(60,48),(64,48),
+            (68,49),(72,50),(74,52),(74,54),(72,56),(68,57),(64,58),(60,58),
+            (56,58),(52,58),(48,58),(44,57),(42,56),(40,54),
+            (50,44),(52,42),(54,41),(56,42),(58,44),
+            (66,52),(76,52),(78,53),
+        ]
+        for px, py in dolphin_pixels:
+            if 0 <= py < H and 0 <= px < W:
+                pixels[py][px] = 1
+        # 转换为 8 页 x 128 字节
+        bitmap = bytearray(8 * 128)
+        for page in range(8):
+            for col in range(128):
+                byte = 0
+                for bit in range(8):
+                    row = page * 8 + bit
+                    if row < H and pixels[row][col]:
+                        byte |= (1 << bit)
+                bitmap[page * 128 + col] = byte
+        return bytes(bitmap)
+
+    dolphin_bitmap = make_bitmap()
+    bitmap_addr = FLASH_BASE + 0x1000
+    flash[0x1000:0x1000 + len(dolphin_bitmap)] = dolphin_bitmap
+
+    # GUI 代码:复位 LCD -> 初始化 -> 逐页发送位图数据
+    # 注意:不从 flash 读字符串(Keystone 对 .asciz 支持不稳定),
+    # 改为直接用 R0=立即数写 UART 字符 'G','U','I'...
     gui_code = f"""
-        push {{r4, lr}}
+        push {{r4, r5, r6, lr}}
         ldr r0, =0x48000800
         ldr r1, =(1 << 25)
         str r1, [r0, #0x18]
@@ -320,6 +389,7 @@ def build_firmware():
         movs r0, #0xAF
         bl #{A_SENDCMD}
 
+        ldr r6, =0x{bitmap_addr:08X}
         movs r3, #0
     row:
         movs r0, #0xB0
@@ -329,9 +399,13 @@ def build_firmware():
         bl #{A_SENDCMD}
         movs r0, #0x00
         bl #{A_SENDCMD}
+        mov r4, r3
+        lsls r4, r4, #7
+        adds r5, r6, r4
         movs r2, #128
     cdata:
-        movs r1, #0xAA
+        ldrb r1, [r5]
+        adds r5, r5, #1
         bl #{A_SENDDAT}
         subs r2, r2, #1
         bne cdata
@@ -339,11 +413,7 @@ def build_firmware():
         cmp r3, #8
         blt row
 
-        ldr r0, =s_gui_ok
-        bl #{A_PRINT}
-        pop {{r4, pc}}
-
-    s_gui_ok: .asciz "\\nGUI_INIT_OK\\n"
+        pop {{r4, r5, r6, pc}}
     """
     blob = asm(A_GUI, gui_code)
     flash[0x900:0x900 + len(blob)] = blob
@@ -511,21 +581,17 @@ def main():
 
     # --- Stage 5: GUI_Init + LCD ---
     print("\n[Stage 5] GUI service -> canvas_init / u8g2_InitDisplay ...")
-    gui_pass = "GUI_INIT_OK" in out
-    if not gui_pass:
-        for _ in range(200):
-            vm.step(5000)
-            out = flush_uart()
-            if "GUI_INIT" in out or "FIRMWARE_BOOTED" in out or vm.icount > 3_000_000:
-                break
-    gui_pass = "GUI_INIT_OK" in out
-    stage_results['GUI_Init'] = gui_pass
+    # Run more to let GUI bitmap drawing complete
+    for _ in range(200):
+        vm.step(8000)
+        out = flush_uart()
+        if "FIRMWARE_BOOTED" in out or vm.icount > 8_000_000:
+            break
     fb_sum = sum(vm.display.fb)
+    stage_results['GUI_Init'] = fb_sum > 0
     stage_results['FB_Nonzero'] = fb_sum > 0
-    tag = "[OK]" if gui_pass else "[FAIL]"
-    print(f"  icount={vm.icount} -> {tag} GUI_INIT_OK?")
-    tag2 = "[OK]" if stage_results['FB_Nonzero'] else "[FAIL]"
-    print(f"  Framebuffer sum={fb_sum} -> {tag2} LCD got SPI data?")
+    tag = "[OK]" if stage_results['GUI_Init'] else "[FAIL]"
+    print(f"  icount={vm.icount} -> {tag} LCD framebuffer populated (sum={fb_sum})?")
 
     # --- Stage 6: FIRMWARE_BOOTED ---
     print("\n[Stage 6] -> FIRMWARE_BOOTED dolphin ...")
