@@ -177,7 +177,7 @@ def build_firmware():
         beq wait_lse
     wait_lsi:
         ldr r1, [r0, #0x94]
-        movs r2, #(1 << 3)
+        movs r2, #(1 << 1)
         tst r1, r2
         beq wait_lsi
 

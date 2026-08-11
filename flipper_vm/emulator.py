@@ -19,6 +19,7 @@ from unicorn.arm_const import (
     UC_ARM_REG_SP, UC_ARM_REG_PC, UC_ARM_REG_LR,
     UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
     UC_ARM_REG_R12, UC_ARM_REG_CPSR, UC_ARM_REG_XPSR,
+    UC_ARM_REG_MSP, UC_ARM_REG_PSP,
 )
 
 from .stm32wb55 import (
@@ -47,6 +48,21 @@ IRQ0_OFFSET = 16  # IRQ0 -> exception 16
 SCB_ICSR = 0xE000ED04  # Interrupt Control and State Register
 SCB_ICSR_PENDSVSET = 1 << 28
 SCB_ICSR_PENDSTSET = 1 << 26
+
+# DWT (Data Watchpoint and Trace) — 0xE0001000
+DWT_BASE      = 0xE0001000
+DWT_CTRL      = DWT_BASE + 0x00  # Control: bit0=CYCCNTENA, bits[28:31]=NUMCOMP
+DWT_CYCCNT    = DWT_BASE + 0x04  # Cycle counter (increment per cycle)
+DWT_CPICNT    = DWT_BASE + 0x08
+DWT_EXCCNT    = DWT_BASE + 0x0C
+DWT_SLEEPCNT  = DWT_BASE + 0x10
+DWT_LSUCNT    = DWT_BASE + 0x14
+DWT_FOLDCNT   = DWT_BASE + 0x18
+DWT_PCSR      = DWT_BASE + 0x1C  # Program Counter Sample
+
+# DEMCR (Debug Exception and Monitor Control Register) — 0xE000EDFC
+DEMCR         = 0xE000EDFC
+DEMCR_TRCENA  = 1 << 24  # Enable DWT/ITM trace
 
 # Unicorn ARM 异常号
 UC_ARM_EXCP_SWI = 2  # SVC/SWI 异常
@@ -238,7 +254,7 @@ class RCC(Peripheral):
     # BDCR 位定义
     LSERDY   = 1 << 1    # LSE ready (32.768kHz external crystal for RTC)
     # CSR 位定义
-    LSI1RDY  = 1 << 3    # LSI1 ready (internal low-speed RC for RTC)
+    LSI1RDY  = 1 << 1    # LSI1 ready (RM0434: RCC_CSR bit 1)
     # CRRCR 位定义
     HSI48RDY = 1 << 1    # HSI48 ready (USB/RNG clock)
     # CFGR SWS 位
@@ -561,9 +577,12 @@ class FlipperVM:
         self.systick_ctrl = 0
         self.systick_val = 0
         self.systick_countdown = 0
+        self._systick_countflag = False  # COUNTFLAG (bit 16 of CTRL)
         self.in_handler = 0   # 当前处于异常处理层数
+        self._exc_return_psp = False  # 异常返回时是否使用 PSP
         self._pendsv_pending = False  # PendSV pending (FreeRTOS 上下文切换)
         self._systick_pending = False  # SysTick pending (SCB_ICSR.PENDSTSET)
+        self._dwt_cyccnt_base = 0     # DWT cycle counter reset base
         self.nvic_iser = [0, 0, 0, 0]   # 32-bit ×4 = 128 IRQs enable
         self.nvic_pending = [0, 0, 0, 0]
         self.nvic_active = [0, 0, 0, 0]
@@ -733,6 +752,7 @@ class FlipperVM:
             if self.systick_countdown <= 0:
                 self.systick_countdown = self.systick_load
                 self.systick_val = 0
+                self._systick_countflag = True  # Set COUNTFLAG
                 if self.systick_ctrl & 0x2:  # TICKINT
                     self._fire_exception(EXC_SYSTICK)
         # 检查 PendSV pending (FreeRTOS 上下文切换)
@@ -759,7 +779,23 @@ class FlipperVM:
         """手动进入异常:压栈 8 字,设置 LR=EXC_RETURN,PC=向量。"""
         if self.in_handler >= 4:
             return  # 嵌套过深,忽略
-        sp = self.uc.reg_read(UC_ARM_REG_SP)
+        # Cortex-M:异常进入时,如果线程模式使用 PSP,则切换到 MSP
+        if self.in_handler == 0:
+            # 线程模式 → handler 模式:检查使用的是 MSP 还是 PSP
+            cur_sp = self.uc.reg_read(UC_ARM_REG_SP)
+            msp = self.uc.reg_read(UC_ARM_REG_MSP)
+            psp = self.uc.reg_read(UC_ARM_REG_PSP)
+            if cur_sp == psp and psp != msp:
+                # 使用 PSP → 切换到 MSP
+                sp = msp
+                self._exc_return_psp = True
+            else:
+                sp = cur_sp
+                self._exc_return_psp = False
+        else:
+            # 已在 handler 模式,继续用 MSP
+            sp = self.uc.reg_read(UC_ARM_REG_SP)
+            self._exc_return_psp = False
         sp -= 32
         # 压入 {R0,R1,R2,R3,R12,LR,PC,xPSR}
         r0 = self.uc.reg_read(UC_ARM_REG_R0)
@@ -773,8 +809,13 @@ class FlipperVM:
         frame = struct.pack("<IIIIIIII", r0, r1, r2, r3, r12, lr, pc, xpsr)
         self.uc.mem_write(sp, frame)
         self.uc.reg_write(UC_ARM_REG_SP, sp)
-        # EXC_RETURN:thread → handler,使用 MSP,无 FPU
-        self.uc.reg_write(UC_ARM_REG_LR, 0xFFFFFFF9)
+        # 同步 MSP 寄存器
+        self.uc.reg_write(UC_ARM_REG_MSP, sp)
+        # EXC_RETURN:thread → handler
+        # 0xFFFFFFF9 = 返回 thread 模式,使用 MSP
+        # 0xFFFFFFFD = 返回 thread 模式,使用 PSP
+        exc_return = 0xFFFFFFFD if self._exc_return_psp else 0xFFFFFFF9
+        self.uc.reg_write(UC_ARM_REG_LR, exc_return)
         handler_addr = self._vector_address(exception)
         self.uc.reg_write(UC_ARM_REG_PC, handler_addr)
         self.in_handler += 1
@@ -796,7 +837,16 @@ class FlipperVM:
         # Cortex-M:返回 PC 必须保留 Thumb 位(bit0=1),否则 unicorn 当 ARM 解码
         self.uc.reg_write(UC_ARM_REG_PC, pc | 1)
         self.uc.reg_write(UC_ARM_REG_XPSR, xpsr & 0xF8000000 | (1 << 24))
-        self.uc.reg_write(UC_ARM_REG_SP, sp + 32)
+        sp += 32
+        # 同步 MSP
+        self.uc.reg_write(UC_ARM_REG_MSP, sp)
+        # 根据 EXC_RETURN 选择返回后的栈指针
+        if exc_return == 0xFFFFFFFD:
+            # 返回 thread 模式,使用 PSP
+            self.uc.reg_write(UC_ARM_REG_SP, self.uc.reg_read(UC_ARM_REG_PSP))
+        else:
+            # 返回 thread 模式,使用 MSP (0xFFFFFFF9) 或 handler 模式 (0xFFFFFFF1)
+            self.uc.reg_write(UC_ARM_REG_SP, sp)
         if self.in_handler > 0:
             self.in_handler -= 1
 
@@ -851,6 +901,17 @@ class FlipperVM:
             val = self._systick_read(address - SYSTICK_BASE, size)
             uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
             return
+        # DWT (Data Watchpoint and Trace)
+        if DWT_BASE <= address < DWT_BASE + 0x20:
+            val = self._dwt_read(address - DWT_BASE, size)
+            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            return
+        # DEMCR: TRCENA bit always set (DWT enabled)
+        if address == DEMCR:
+            val = int.from_bytes(self.ppb[off:off + size], "little")
+            val |= DEMCR_TRCENA
+            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            return
         # NVIC ISER/ISPR/ICPR 寄存器
         if NVIC_BASE <= address < NVIC_BASE + 0x300:
             val = self._nvic_read(address - NVIC_BASE, size)
@@ -874,6 +935,10 @@ class FlipperVM:
         if SYSTICK_BASE <= address < SYSTICK_BASE + 0x10:
             self._systick_write(address - SYSTICK_BASE, size, value)
             return
+        # DWT: handle CYCCNT writes (firmware writes 0 to reset counter)
+        if DWT_BASE <= address < DWT_BASE + 0x20:
+            self._dwt_write(address - DWT_BASE, size, value)
+            return
         if NVIC_BASE <= address < NVIC_BASE + 0x300:
             self._nvic_write(address - NVIC_BASE, size, value)
             return
@@ -889,8 +954,12 @@ class FlipperVM:
         self.ppb[off:off + size] = (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
 
     def _systick_read(self, off, size):
-        if off == 0x00:   # CTRL
-            return self.systick_ctrl
+        if off == 0x00:   # CTRL — bit 16 = COUNTFLAG (set when timer hits 0, cleared on read)
+            val = self.systick_ctrl
+            if self._systick_countflag:
+                val |= (1 << 16)
+                self._systick_countflag = False  # Reading CTRL clears COUNTFLAG
+            return val
         if off == 0x04:   # LOAD
             return self.systick_load
         if off == 0x08:   # VAL
@@ -909,6 +978,31 @@ class FlipperVM:
         elif off == 0x08:
             self.systick_val = 0
             self.systick_countdown = self.systick_load if self.systick_ctrl & 0x1 else 0
+
+    # ---------- DWT (Data Watchpoint and Trace) ----------
+    # 固件使用 DWT_CYCCNT 实现精确延时 (furi_hal_cortex_delay_us)
+    # 必须返回递增值,否则延时循环永远无法退出
+    # 使用 8x 乘数:真实 Cortex-M4 @64MHz 每条指令约 1 cycle,
+    # 但考虑流水线停顿/内存等待,有效 CPI 约 4-8,这里取 8 加速仿真
+    DWT_CYCCNT_MULTIPLIER = 8
+
+    def _dwt_read(self, off, size):
+        if off == 0x00:   # DWT_CTRL
+            # CYCCNTENA=1 (bit0), NUMCOMP=1 (bits[28:31] at least 1 comparator)
+            return 0x10000001
+        if off == 0x04:   # DWT_CYCCNT — 返回自上次重置以来的周期数
+            return ((self.icount - self._dwt_cyccnt_base) * self.DWT_CYCCNT_MULTIPLIER) & 0xFFFFFFFF
+        if off == 0x1C:   # DWT_PCSR — 返回当前 PC
+            return self.uc.reg_read(UC_ARM_REG_PC)
+        # 其它 DWT 寄存器返回 0
+        return 0
+
+    def _dwt_write(self, off, size, value):
+        # 固件写 DWT_CYCCNT=0 来重置计数器
+        if off == 0x04:
+            # 重置 cycle counter 基准
+            self._dwt_cyccnt_base = self.icount
+        # DWT_CTRL 写入忽略(CYCCNTENA 始终为 1)
 
     def _nvic_read(self, off, size):
         # ISER(offset 0x00)/ICER(0x80) 读出 enable
