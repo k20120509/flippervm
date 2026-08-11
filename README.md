@@ -25,7 +25,7 @@
 **一次下载,永远不用配置环境。**
 
 1. 打开 [Release 下载页](https://github.com/k20120509/flippervm/releases/latest)
-2. 找到 **最新版本**(v0.4.2 或更高),下载名为
+2. 找到 **最新版本**(v0.5.0 或更高),下载名为
    `FlipperVM-vX.X.X-portable-win64.zip`
    的压缩包(约 260 MB)
 3. **右键 → 解压到当前文件夹 / 解压到 FlipperVM 文件夹**
@@ -286,6 +286,7 @@ Actions 会自动在 Windows runner 上跑,产出会自动附加到 Release:
 
 | 版本 | 说明 |
 |---|---|
+| v0.5.0 | **重大修复:FreeRTOS 支持 + 时钟初始化全通**:修复 RCC SWS=PLL(0b11);新增 PLLSAI1RDY/BDCR.LSERDY/CSR.LSI1RDY;修复 PWR SR1/SR2 地址错误;新增 SVC 异常处理(FreeRTOS 启动);新增 PendSV/SCB_ICSR 拦截(FreeRTOS 上下文切换) |
 | v0.4.2 | **修复固件卡死 5 分钟**:新增 IPCC/HWSEM/RNG/PKA/RTC 双核外设仿真;GUI 8s 卡死自动报警(显示循环 PC 范围);PWR.CR4.C2BOOT 强制 CPU2 已启动 |
 | v0.4.1 | **修复固件卡死+启动画面**:RCC 时钟就绪标志位仿真;加载固件后显示诊断信息;UART 异常报告;GUI 黑屏优化 |
 | v0.4.0 | **修复 LCD 显示不亮**:GPIO 钩子在所有寄存器写入时触发;加载固件后自动初始化 DC/RST 并强制开屏;GUI 在屏幕关闭态也渲染 framebuffer |

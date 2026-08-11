@@ -43,6 +43,14 @@ EXC_PENDSV = 14
 EXC_SYSTICK = 15
 IRQ0_OFFSET = 16  # IRQ0 -> exception 16
 
+# SCB 寄存器偏移
+SCB_ICSR = 0xE000ED04  # Interrupt Control and State Register
+SCB_ICSR_PENDSVSET = 1 << 28
+SCB_ICSR_PENDSTSET = 1 << 26
+
+# Unicorn ARM 异常号
+UC_ARM_EXCP_SWI = 2  # SVC/SWI 异常
+
 
 # ====== 通用外设基类 ======
 class Peripheral:
@@ -211,39 +219,64 @@ class RCC(Peripheral):
     """STM32WB55 RCC (Reset and Clock Control) 仿真。
 
     关键:所有时钟就绪标志位返回 1,否则固件会死循环等待时钟就绪。
+    参考:RM0434 STM32WB55 参考手册
     """
     CR      = 0x00   # Clock control register
-    ICSCR  = 0x04   # Internal clock sources calibration
+    ICSCR   = 0x04   # Internal clock sources calibration
     CFGR    = 0x08   # Clock configuration register
-    CSR     = 0x94   # Clock control & status register
-    CRRCR   = 0x98   # Clock recovery RC register
-    CRRCR_48RDY = 1 << 1   # HSI48 ready
-    HSERDY  = 1 << 9   # HSE ready (Flipper uses external crystal)
-    HSIRDY  = 1 << 0   # HSI ready
-    HSIKERDY = 1 << 7  # HSI kernel ready
-    PLLRDY  = 1 << 25  # PLL ready
+    CRRCR   = 0x0C   # Clock recovery RC register (HSI48)
+    EXTCFGR = 0x10   # Extended clock configuration
+    BDCR    = 0x90   # Backup domain control register (LSE)
+    CSR     = 0x94   # Clock control & status register (LSI)
+    # CR 位定义
+    HSIRDY   = 1 << 0    # HSI ready
+    MSIRDY   = 1 << 1    # MSI ready (firmware checks this=0 after disable)
+    HSIKERDY = 1 << 7    # HSI kernel ready
+    HSERDY   = 1 << 9    # HSE ready (Flipper uses external crystal)
+    PLLSAI1RDY = 1 << 24 # PLLSAI1 ready (48MHz/ADC clock)
+    PLLRDY   = 1 << 25   # PLL ready
+    # BDCR 位定义
+    LSERDY   = 1 << 1    # LSE ready (32.768kHz external crystal for RTC)
+    # CSR 位定义
+    LSI1RDY  = 1 << 3    # LSI1 ready (internal low-speed RC for RTC)
+    # CRRCR 位定义
+    HSI48RDY = 1 << 1    # HSI48 ready (USB/RNG clock)
+    # CFGR SWS 位
+    SWS_PLL  = 0b11 << 2  # System clock switch status: PLL
 
     def __init__(self, base, size, name="RCC"):
         super().__init__(base, size, name)
 
     def read(self, offset, size):
         val = int.from_bytes(self.regs[offset:offset + size], "little")
+        # CR: 强制所有就绪标志位为 1 (HSI/HSIKER/HSE/PLL/PLLSAI1)
+        # 注意:MSIRDY 不强制为 1 — 固件关闭 MSI 后检查 MSIRDY==0
         if offset == self.CR or (offset <= self.CR + 4 and offset + size > self.CR):
-            # 读 CR:强制所有就绪标志位为 1
             val = int.from_bytes(self.regs[0:4], "little")
-            val |= self.HSIRDY | self.HSIKERDY | self.HSERDY | self.PLLRDY
+            val |= self.HSIRDY | self.HSIKERDY | self.HSERDY | self.PLLRDY | self.PLLSAI1RDY
             if size == 4:
                 return val
             elif size == 2:
                 return val & 0xFFFF
             else:
                 return val & 0xFF
-        if offset == self.CRRCR:
-            return val | self.CRRCR_48RDY
-        # CFGR: 返回当前系统时钟源为 PLL (SWS=0b10)
+        # CRRCR: HSI48 ready (STM32WB55 可能在 0x0C 或 0x98 访问)
+        if offset == self.CRRCR or offset == 0x98:
+            return val | self.HSI48RDY
+        # BDCR: LSE ready (固件等 LL_RCC_LSE_IsReady())
+        if offset == self.BDCR:
+            val = int.from_bytes(self.regs[self.BDCR:self.BDCR + 4], "little")
+            val |= self.LSERDY
+            return val & 0xFFFFFFFF
+        # CSR: LSI1 ready (固件等 LL_RCC_LSI1_IsReady())
+        if offset == self.CSR:
+            val = int.from_bytes(self.regs[self.CSR:self.CSR + 4], "little")
+            val |= self.LSI1RDY
+            return val & 0xFFFFFFFF
+        # CFGR: 返回当前系统时钟源为 PLL (SWS=0b11)
         if offset == self.CFGR:
             val = int.from_bytes(self.regs[self.CFGR:self.CFGR + 4], "little")
-            val |= (0b10 << 2)  # SWS = PLL
+            val |= self.SWS_PLL
             if size == 4:
                 return val
             elif size == 2:
@@ -267,25 +300,31 @@ class FLASHController(Peripheral):
 
 
 class PWR(Peripheral):
-    """STM32WB55 PWR (Power Control) 仿真。"""
-    SR1 = 0x00
-    SR2 = 0x04
+    """STM32WB55 PWR (Power Control) 仿真。
+
+    RM0434 寄存器映射:
+      CR1=0x00, CR2=0x04, CR3=0x08, CR4=0x0C, CR5=0x10
+      SR1=0x94, SR2=0x98 (注意:SR1/SR2 在 CR 系列之后,不是 0x00/0x04!)
+    """
     CR1 = 0x00
     CR2 = 0x04
     CR3 = 0x08
     CR4 = 0x0C
     CR5 = 0x10
+    SR1 = 0x94
+    SR2 = 0x98
 
     def read(self, offset, size):
         val = int.from_bytes(self.regs[offset:offset + size], "little")
-        # SR1: 所有就绪标志位返回 1 (WUF, SBF, etc. cleared = ready)
+        # SR1: 所有 wakeup 标志位清零 (ready)
         if offset == self.SR1:
-            return val & ~0x1F  # 清除所有 wakeup flags
+            return val & ~0x1F
+        # SR2: REGLPS=1 (regulator in main mode), REGF=0 (no fallback)
         if offset == self.SR2:
-            return val | (1 << 13)  # REGLPS = regulator in main mode
-        # CR4: C2BOOT 位读为 1(CPU2 已启动),让固件认为 CPU2 已启动
+            return val | (1 << 13)
+        # CR4: C2BOOT 位读为 1(CPU2 已启动)
         if offset == self.CR4:
-            return val | (1 << 15)  # C2BOOT = CPU2 boot/enable
+            return val | (1 << 15)
         return val
 
 
@@ -523,6 +562,8 @@ class FlipperVM:
         self.systick_val = 0
         self.systick_countdown = 0
         self.in_handler = 0   # 当前处于异常处理层数
+        self._pendsv_pending = False  # PendSV pending (FreeRTOS 上下文切换)
+        self._systick_pending = False  # SysTick pending (SCB_ICSR.PENDSTSET)
         self.nvic_iser = [0, 0, 0, 0]   # 32-bit ×4 = 128 IRQs enable
         self.nvic_pending = [0, 0, 0, 0]
         self.nvic_active = [0, 0, 0, 0]
@@ -670,7 +711,7 @@ class FlipperVM:
 
     # ---------- 主执行循环 ----------
     def step(self, n_instructions: int = 1000) -> None:
-        """执行 N 条指令,期间检查 SysTick / pending IRQ。"""
+        """执行 N 条指令,期间检查 SysTick / PendSV / pending IRQ。"""
         # emu_start 的 begin 必须带 Thumb 位(bit0=1),否则 unicorn 当 ARM 解码
         begin = self.uc.reg_read(UC_ARM_REG_PC) | 1
         try:
@@ -694,6 +735,15 @@ class FlipperVM:
                 self.systick_val = 0
                 if self.systick_ctrl & 0x2:  # TICKINT
                     self._fire_exception(EXC_SYSTICK)
+        # 检查 PendSV pending (FreeRTOS 上下文切换)
+        if self._pendsv_pending and self.in_handler == 0:
+            self._pendsv_pending = False
+            self._fire_exception(EXC_PENDSV)
+        # 检查 SysTick pending (SCB_ICSR.PENDSTSET 方式)
+        if self._systick_pending and self.in_handler == 0:
+            self._systick_pending = False
+            if self.systick_ctrl & 0x2:  # TICKINT
+                self._fire_exception(EXC_SYSTICK)
         # 检查 pending IRQ
         self._dispatch_pending_irq()
 
@@ -802,6 +852,15 @@ class FlipperVM:
             val = self._nvic_read(address - NVIC_BASE, size)
             uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
             return
+        # SCB_ICSR: 返回 PendSV/SysTick pending 状态
+        if address == SCB_ICSR:
+            val = int.from_bytes(self.ppb[off:off + size], "little")
+            if self._pendsv_pending:
+                val |= SCB_ICSR_PENDSVSET
+            if self._systick_pending:
+                val |= SCB_ICSR_PENDSTSET
+            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            return
         # SCB VTOR / 其它
         val = int.from_bytes(self.ppb[off:off + size], "little")
         uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
@@ -813,6 +872,15 @@ class FlipperVM:
             return
         if NVIC_BASE <= address < NVIC_BASE + 0x300:
             self._nvic_write(address - NVIC_BASE, size, value)
+            return
+        # SCB_ICSR: FreeRTOS 写 PENDSVSET 触发 PendSV, 写 PENDSTSET 触发 SysTick
+        if address == SCB_ICSR:
+            if value & SCB_ICSR_PENDSVSET:
+                self._pendsv_pending = True
+            if value & SCB_ICSR_PENDSTSET:
+                self._systick_pending = True
+            # 不存储 PENDSVSET/PENDSTSET 位(它们是 write-1-to-set, 读取时反映 pending 状态)
+            self.ppb[off:off + size] = (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
             return
         self.ppb[off:off + size] = (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
 
@@ -889,14 +957,16 @@ class FlipperVM:
         except Exception:
             return False
 
-    # ---------- 中断钩子(主要处理 EXC_RETURN)----------
+    # ---------- 中断钩子(处理 SVC/PendSV/EXC_RETURN)----------
     def _hook_intr(self, uc, intno, user_data):
         lr = uc.reg_read(UC_ARM_REG_LR)
         # LR 是 EXC_RETURN 值 → 当前是从异常返回(我们的手动 handler 里 BX LR 触发)
         if lr & 0xFF000000 == 0xFF000000:
             self._return_from_exception(lr)
             return
-        # unicorn 内置 HardFault(intno=2/3):通常因为非法内存访问或指令错误
-        # 这里只记录,不再递归 fire(避免无限 HardFault 循环)
-        # 真实固件遇到这种情况说明外设仿真有缺漏,交给上层看 UART 输出排查
+        # SVC 异常:FreeRTOS 用 SVC 启动第一个任务和系统调用
+        if intno == UC_ARM_EXCP_SWI:
+            self._fire_exception(EXC_SVCALL)
+            return
+        # 其他异常(HardFault 等):记录但不递归 fire
         return
