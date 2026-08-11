@@ -291,6 +291,7 @@ Actions 会自动在 Windows runner 上跑,产出会自动附加到 Release:
 
 | 版本 | 说明 |
 |---|---|
+| **v1.0.1** | **修复真实固件 UC_ERR_WRITE_UNMAPPED 崩溃**:异常进入时检测 SP 有效性,PSP 未初始化(=0)时回退到 MSP;新增 UC_HOOK_MEM_FETCH_UNMAPPED 钩子,固件跳转到 NULL 时填充 `b .` 防止崩溃;修正 `_return_from_exception` 从 PSP 出栈(EXC_RETURN=0xFFFFFFFD);真实固件现在可运行 1000 万+ 条指令无崩溃 |
 | **v1.0.0** | **🎉 首个正式版**:全量测试通过(冒烟 / SysTick / 集成 / 启动流程 6 阶段);真实固件(Momentum mntm-012)可加载并执行 10 万+ 条指令正常推进启动;新增 DWT_CYCCNT 周期计数器(延时循环可退出);修复 SysTick COUNTFLAG 位;修复 LSI1RDY 位(RM0434 bit1);实现 MSP/PSP 栈切换(EXC_RETURN);启动流程诊断脚本完整对照硬件启动表 |
 | v0.5.0 | **重大修复:FreeRTOS 支持 + 时钟初始化全通**:修复 RCC SWS=PLL(0b11);新增 PLLSAI1RDY/BDCR.LSERDY/CSR.LSI1RDY;修复 PWR SR1/SR2 地址错误;新增 SVC 异常处理(FreeRTOS 启动);新增 PendSV/SCB_ICSR 拦截(FreeRTOS 上下文切换) |
 | v0.4.2 | **修复固件卡死 5 分钟**:新增 IPCC/HWSEM/RNG/PKA/RTC 双核外设仿真;GUI 8s 卡死自动报警(显示循环 PC 范围);PWR.CR4.C2BOOT 强制 CPU2 已启动 |

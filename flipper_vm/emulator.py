@@ -13,6 +13,7 @@ from unicorn import (
     Uc, UC_ARCH_ARM, UC_MODE_MCLASS, UC_MODE_THUMB,
     UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
     UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED,
+    UC_HOOK_MEM_FETCH_UNMAPPED,
     UC_HOOK_INTR, UC_ERR_OK, UC_PROT_ALL,
 )
 from unicorn.arm_const import (
@@ -602,6 +603,7 @@ class FlipperVM:
                          end=self.PPB_REGION_BASE + self.PPB_REGION_SIZE - 1)
         self.uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED, self._hook_unmapped)
         self.uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, self._hook_unmapped)
+        self.uc.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, self._hook_fetch_unmapped)
         self.uc.hook_add(UC_HOOK_INTR, self._hook_intr)
         # 注意:不再注册 UC_HOOK_CODE(_hook_code 性能极差,每条指令回调 Python)
         # icount 通过 step(count=N) 的 N 累加估算
@@ -776,27 +778,44 @@ class FlipperVM:
         return val | 1
 
     def _fire_exception(self, exception: int) -> None:
-        """手动进入异常:压栈 8 字,设置 LR=EXC_RETURN,PC=向量。"""
+        """手动进入异常:压栈 8 字,设置 LR=EXC_RETURN,PC=向量。
+
+        Cortex-M 硬件行为:
+          - 线程模式用 PSP 时:帧压入 PSP,切换到 MSP 进 handler,EXC_RETURN=0xFFFFFFFD
+          - 线程模式用 MSP 时:帧压入 MSP,继续用 MSP,EXC_RETURN=0xFFFFFFF9
+          - 已在 handler 模式:帧压入 MSP,EXC_RETURN=0xFFFFFFF1(返回 handler)
+        """
         if self.in_handler >= 4:
             return  # 嵌套过深,忽略
-        # Cortex-M:异常进入时,如果线程模式使用 PSP,则切换到 MSP
+        # Cortex-M:异常进入时,如果线程模式使用 PSP,则帧压入 PSP,然后切到 MSP
         if self.in_handler == 0:
-            # 线程模式 → handler 模式:检查使用的是 MSP 还是 PSP
             cur_sp = self.uc.reg_read(UC_ARM_REG_SP)
             msp = self.uc.reg_read(UC_ARM_REG_MSP)
             psp = self.uc.reg_read(UC_ARM_REG_PSP)
+            # 防御:如果当前 SP 不在有效 SRAM 范围内(如 PSP 未初始化=0),
+            # 回退到 MSP;如果 MSP 也不有效,跳过异常避免崩溃
+            # 注意:SP 可以等于 SRAM 末尾(栈向下增长,首次压栈 SP-32 仍在范围内)
+            sram_end = SRAM1_BASE + SRAM1_SIZE + SRAM2_SIZE
+            if cur_sp < SRAM1_BASE or cur_sp > sram_end:
+                cur_sp = msp  # 回退到 MSP
+            if cur_sp < SRAM1_BASE or cur_sp > sram_end:
+                return  # MSP 和 PSP 都无效,跳过异常
             if cur_sp == psp and psp != msp:
-                # 使用 PSP → 切换到 MSP
-                sp = msp
+                # 线程用 PSP → 帧压入 PSP,handler 用 MSP
+                frame_sp = psp - 32
                 self._exc_return_psp = True
+                exc_return = 0xFFFFFFFD
             else:
-                sp = cur_sp
+                # 线程用 MSP → 帧压入 MSP
+                frame_sp = msp - 32
                 self._exc_return_psp = False
+                exc_return = 0xFFFFFFF9
         else:
-            # 已在 handler 模式,继续用 MSP
-            sp = self.uc.reg_read(UC_ARM_REG_SP)
+            # 已在 handler 模式,帧压入 MSP
+            frame_sp = self.uc.reg_read(UC_ARM_REG_MSP) - 32
             self._exc_return_psp = False
-        sp -= 32
+            exc_return = 0xFFFFFFF1
+
         # 压入 {R0,R1,R2,R3,R12,LR,PC,xPSR}
         r0 = self.uc.reg_read(UC_ARM_REG_R0)
         r1 = self.uc.reg_read(UC_ARM_REG_R1)
@@ -807,14 +826,17 @@ class FlipperVM:
         pc = self.uc.reg_read(UC_ARM_REG_PC)
         xpsr = self.uc.reg_read(UC_ARM_REG_XPSR)
         frame = struct.pack("<IIIIIIII", r0, r1, r2, r3, r12, lr, pc, xpsr)
-        self.uc.mem_write(sp, frame)
-        self.uc.reg_write(UC_ARM_REG_SP, sp)
-        # 同步 MSP 寄存器
-        self.uc.reg_write(UC_ARM_REG_MSP, sp)
-        # EXC_RETURN:thread → handler
-        # 0xFFFFFFF9 = 返回 thread 模式,使用 MSP
-        # 0xFFFFFFFD = 返回 thread 模式,使用 PSP
-        exc_return = 0xFFFFFFFD if self._exc_return_psp else 0xFFFFFFF9
+        self.uc.mem_write(frame_sp, frame)
+
+        if exc_return == 0xFFFFFFFD:
+            # 帧在 PSP 上,更新 PSP;handler 用 MSP
+            self.uc.reg_write(UC_ARM_REG_PSP, frame_sp)
+            self.uc.reg_write(UC_ARM_REG_SP, msp)
+        else:
+            # 帧在 MSP 上
+            self.uc.reg_write(UC_ARM_REG_MSP, frame_sp)
+            self.uc.reg_write(UC_ARM_REG_SP, frame_sp)
+
         self.uc.reg_write(UC_ARM_REG_LR, exc_return)
         handler_addr = self._vector_address(exception)
         self.uc.reg_write(UC_ARM_REG_PC, handler_addr)
@@ -824,8 +846,18 @@ class FlipperVM:
             self.nvic_active[irq // 32] |= 1 << (irq % 32)
 
     def _return_from_exception(self, exc_return: int) -> None:
-        """从异常返回:出栈 8 字恢复上下文。"""
-        sp = self.uc.reg_read(UC_ARM_REG_SP)
+        """从异常返回:出栈 8 字恢复上下文。
+
+        Cortex-M 硬件行为:
+          - EXC_RETURN=0xFFFFFFFD:从 PSP 出栈,返回 thread 模式用 PSP
+            (FreeRTOS SVC handler 会修改 PSP 指向新任务栈,这里必须从 PSP 读帧)
+          - EXC_RETURN=0xFFFFFFF9:从 MSP 出栈,返回 thread 模式用 MSP
+          - EXC_RETURN=0xFFFFFFF1:从 MSP 出栈,返回 handler 模式用 MSP
+        """
+        if exc_return == 0xFFFFFFFD:
+            sp = self.uc.reg_read(UC_ARM_REG_PSP)
+        else:
+            sp = self.uc.reg_read(UC_ARM_REG_MSP)
         frame = self.uc.mem_read(sp, 32)
         r0, r1, r2, r3, r12, lr, pc, xpsr = struct.unpack("<IIIIIIII", frame)
         self.uc.reg_write(UC_ARM_REG_R0, r0)
@@ -838,14 +870,11 @@ class FlipperVM:
         self.uc.reg_write(UC_ARM_REG_PC, pc | 1)
         self.uc.reg_write(UC_ARM_REG_XPSR, xpsr & 0xF8000000 | (1 << 24))
         sp += 32
-        # 同步 MSP
-        self.uc.reg_write(UC_ARM_REG_MSP, sp)
-        # 根据 EXC_RETURN 选择返回后的栈指针
         if exc_return == 0xFFFFFFFD:
-            # 返回 thread 模式,使用 PSP
-            self.uc.reg_write(UC_ARM_REG_SP, self.uc.reg_read(UC_ARM_REG_PSP))
+            self.uc.reg_write(UC_ARM_REG_PSP, sp)
+            self.uc.reg_write(UC_ARM_REG_SP, sp)
         else:
-            # 返回 thread 模式,使用 MSP (0xFFFFFFF9) 或 handler 模式 (0xFFFFFFF1)
+            self.uc.reg_write(UC_ARM_REG_MSP, sp)
             self.uc.reg_write(UC_ARM_REG_SP, sp)
         if self.in_handler > 0:
             self.in_handler -= 1
@@ -1051,6 +1080,18 @@ class FlipperVM:
             uc.mem_map(address & ~0xFFF, 0x1000, UC_PROT_ALL)
             if access == 2:  # WRITE
                 uc.mem_write(address, (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little"))
+            return True
+        except Exception:
+            return False
+
+    def _hook_fetch_unmapped(self, uc, access, address, size, value, user_data):
+        """代码取指从不映射地址(如固件跳转到 NULL/地址 0)。
+        映射该页并填入 NOP + 无限循环,防止 Unicorn 崩溃。"""
+        try:
+            page = address & ~0xFFF
+            uc.mem_map(page, 0x1000, UC_PROT_ALL)
+            # 填入 "b ." (branch to self = 0xE7FE) 的 Thumb 编码,让 CPU 停在原地
+            uc.mem_write(page, b"\xfe\xe7" * 2048)
             return True
         except Exception:
             return False
