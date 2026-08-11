@@ -34,6 +34,7 @@ VM_RUN_THREAD: threading.Thread | None = None
 VM_RUN_STOP = threading.Event()
 UART_LOG_CHARS: list[str] = []
 RUN_SPEED_KIPS = 50  # 每 step ~RUN_SPEED_KIPS*1000 指令
+VM_STEP_LOCK = threading.Lock()  # 保护 Unicorn VM 操作 (非线程安全)
 
 
 # ===== 5x7 像素字,和 Qt GUI 一致 =====
@@ -139,7 +140,7 @@ def make_demo_firmware() -> FirmwareImage:
 # ============================================================
 # LCD -> PIL
 # ============================================================
-def lcd_to_pil(disp: ST7567DisplayAdapter, scale: int = 6) -> Image.Image:
+def lcd_to_pil(disp: ST7567DisplayAdapter, scale: int = 4) -> Image.Image:
     W, H = disp.width, disp.height
     img = Image.new("RGB", (W * scale, H * scale), (192, 224, 160))  # 黄绿 LCD
     draw = ImageDraw.Draw(img)
@@ -153,9 +154,16 @@ def lcd_to_pil(disp: ST7567DisplayAdapter, scale: int = 6) -> Image.Image:
                     (x0, y0, x0 + scale - 1, y0 + scale - 1),
                     fill=(12, 20, 12),
                 )
-    bordered = Image.new("RGB", (img.width + 16, img.height + 16), (90, 110, 82))
-    bordered.paste(img, (8, 8))
+    bordered = Image.new("RGB", (img.width + 8, img.height + 8), (90, 110, 82))
+    bordered.paste(img, (4, 4))
     return bordered
+
+
+def lcd_to_numpy(disp: ST7567DisplayAdapter, scale: int = 4):
+    """将 LCD 转为 numpy 数组 (Gradio 6.x 兼容)。"""
+    import numpy as np
+    img = lcd_to_pil(disp, scale)
+    return np.array(img)
 
 
 # ============================================================
@@ -180,20 +188,23 @@ def _get_vm() -> FlipperVM:
     with VMS_LOCK:
         if THE_VM is None:
             THE_VM = FlipperVM(on_uart_tx=_uart_collector)
-            THE_VM.load_firmware(make_demo_firmware())
+            # 优先加载真实固件 (Momentum v1.1.5)
+            real_fw_path = "/workspace/firmware_files/momentum-fw-v1.1.5.dfu"
+            try:
+                fw = load_firmware(real_fw_path)
+                THE_VM.load_firmware(fw)
+                _append_log(f"[VM] Real firmware loaded: {Path(real_fw_path).name} ({len(fw.data)}B)")
+            except Exception as e:
+                _append_log(f"[VM] Failed to load real firmware: {e}, using demo")
+                THE_VM.load_firmware(make_demo_firmware())
             THE_VM.display.turn_on()
-            # 启动界面画点内容
-            _paint_text_screen(
-                THE_VM.display,
-                "FlipperVM",
-                [
-                    "FlipperVM OK!",
-                    "Web UI LIVE",
-                    "LCD 128x64 SPI",
-                    "UART TX:ON CPU:OK",
-                    "Press OK for iAPP",
-                ],
-            )
+            # 运行一些指令让固件显示启动画面
+            with VM_STEP_LOCK:
+                try:
+                    THE_VM.step(50000)
+                except Exception as e:
+                    _append_log(f"[VM] initial step error: {e}")
+            _append_log("[VM] Firmware initialized. Press Run to continue.")
     return THE_VM
 
 
@@ -222,78 +233,14 @@ def _paint_text_screen(disp: ST7567DisplayAdapter, title: str, lines: list[str])
 def key_action(key: str):
     """key: up/down/left/right/ok/back"""
     vm = _get_vm()
-    vm.set_button(key, True)
-    try:
-        vm.step(5000)
-    except Exception as e:
-        _append_log(f"[key {key}] step error: {e}")
-    vm.set_button(key, False)
-
-    # --- Web UI 专用:按键在 demo 固件(死循环)没效果,所以在这里做屏幕演示内容切换 ---
-    # (真机固件会在主循环里读 GPIO IDR,我们的死循环演示固件没写这代码,
-    #  所以这里用 Python 直接画屏幕内容模拟「按键产生的屏幕效果」,让你点按钮能看到画面变化)
-    if key == "ok":
-        _paint_text_screen(vm.display, "IAPPS MENU", [
-            "[1] Sub-GHz",
-            "[2] 1-Wire",
-            "[3] NFC",
-            "[4] Infrared",
-            "[5] GPIO",
-            "[6] iButton",
-            "[7] Bad USB",
-            "[8] U2F",
-        ])
-        _append_log("[KEY] OK Pressed -> opening iAPP menu...")
-        for app in ("Sub-GHz", "1-Wire", "NFC", "Infrared", "GPIO", "iButton", "Bad USB", "U2F"):
-            _append_log(f"  -> [*] {app}")
-    elif key == "back":
-        _paint_text_screen(vm.display, "FLIPPERVM OK!", [
-            "READY.",
-            "LCD: ON",
-            "UART: ON",
-            "KEYPAD: OK",
-            "v0.3.0",
-        ])
-        _append_log("[KEY] Back -> returned to home screen.")
-    elif key == "up":
-        _paint_text_screen(vm.display, "SCROLL UP", [
-            "GPIO: scanning...",
-            "ADC Vref=3.3V",
-            "DMA1 ENABLED",
-            "CRC32: 0x1234ABCD",
-            "OK = SELECT",
-        ])
-        _append_log("[KEY] Up")
-    elif key == "down":
-        _paint_text_screen(vm.display, "SCROLL DOWN", [
-            "SPI2 BAUD = PCLK/2",
-            "LCD 128x64 MODE=1",
-            "EXTI LINE[0..5]=RISING",
-            "Press OK to open",
-            "selected iAPP.",
-        ])
-        _append_log("[KEY] Down")
-    elif key == "left":
-        _paint_text_screen(vm.display, "NFC -> 13.56MHz", [
-            "PN532 init OK",
-            "Antenna: ON",
-            "Scan target: ISO14443A",
-            "UID length: 4..7B",
-            "OK = SCAN NOW",
-        ])
-        _append_log("[KEY] Left -> NFC iAPP")
-    elif key == "right":
-        _paint_text_screen(vm.display, "SUB-GHZ: LISTEN", [
-            "Radio: CC1101 OK",
-            "Freq: 433.920 MHz",
-            "Mod: ASK/OOK",
-            "Data rate: 2.4kb/s",
-            "Listening... (30s)",
-        ])
-        _append_log("[APP] Sub-GHz iAPP starting...")
-        _append_log("  Radio: CC1101 init @ 433.92MHz OK")
-        _append_log("  Listening... (timeout 30s)")
-
+    with VM_STEP_LOCK:
+        vm.set_button(key, True)
+        try:
+            vm.step(5000)
+        except Exception as e:
+            _append_log(f"[key {key}] step error: {e}")
+        vm.set_button(key, False)
+    _append_log(f"[KEY] {key.upper()}")
     return (refresh_screen(), status_line(), uart_tail(), f"按键 {key.upper()} OK")
 
 
@@ -306,7 +253,8 @@ def _run_loop() -> None:
     last_yield = time.time()
     while not VM_RUN_STOP.is_set():
         try:
-            vm.step(stepsize)
+            with VM_STEP_LOCK:
+                vm.step(stepsize)
         except Exception as e:
             _append_log(f"[VM] step error: {e}")
             break
@@ -340,39 +288,32 @@ def press_stop():
 def press_reset():
     vm = _get_vm()
     press_stop()
-    vm.icount = 0
-    vm.in_handler = 0
-    try:
-        fw = vm.firmware
-        if fw is None:
+    with VM_STEP_LOCK:
+        vm.icount = 0
+        vm.in_handler = 0
+        try:
+            fw = vm.firmware
+            if fw is None:
+                # 重新加载真实固件
+                real_fw_path = "/workspace/firmware_files/momentum-fw-v1.1.5.dfu"
+                fw = load_firmware(real_fw_path)
+            vm.load_firmware(fw)
+        except Exception as e:
             fw = make_demo_firmware()
-        vm.load_firmware(fw)
-    except Exception as e:
-        fw = make_demo_firmware()
-        vm.load_firmware(fw)
-        _append_log(f"[VM] reset reload fallback: {e}")
+            vm.load_firmware(fw)
+            _append_log(f"[VM] reset reload fallback: {e}")
     UART_LOG_CHARS.clear()
     _append_log("[VM] reset complete. firmware reloaded.")
-    _paint_text_screen(
-        vm.display,
-        "FlipperVM",
-        [
-            "FlipperVM OK!",
-            "Reset done.",
-            "LCD 128x64 SPI",
-            "UART TX:ON CPU:OK",
-            "Press OK for iAPP",
-        ],
-    )
     return (refresh_screen(), status_line(), uart_tail(), "复位完成")
 
 
 def press_step():
     vm = _get_vm()
-    try:
-        vm.step(1000)
-    except Exception as e:
-        _append_log(f"[step] error: {e}")
+    with VM_STEP_LOCK:
+        try:
+            vm.step(1000)
+        except Exception as e:
+            _append_log(f"[step] error: {e}")
     return (refresh_screen(), status_line(), uart_tail(), "单步(1000) 完成")
 
 
@@ -380,18 +321,22 @@ def press_step():
 # 显示 / 状态
 # ============================================================
 def refresh_screen():
-    return lcd_to_pil(_get_vm().display, scale=6)
+    vm = _get_vm()
+    with VM_STEP_LOCK:
+        return lcd_to_numpy(vm.display, scale=4)
 
 
 def status_line() -> str:
     vm = _get_vm()
-    try:
-        pc = vm.uc.reg_read(UC_ARM_REG_PC)
-        sp = vm.uc.reg_read(UC_ARM_REG_SP)
-    except Exception:
-        pc = sp = 0
-    r = vm.running
-    return f"{'● RUN' if r else '○ PAUSED'}   PC=0x{pc:08X}  SP=0x{sp:08X}  icount={vm.icount}"
+    with VM_STEP_LOCK:
+        try:
+            pc = vm.uc.reg_read(UC_ARM_REG_PC)
+            sp = vm.uc.reg_read(UC_ARM_REG_SP)
+        except Exception:
+            pc = sp = 0
+        r = vm.running
+        ic = vm.icount
+    return f"{'RUN' if r else 'PAUSE'}  PC=0x{pc:08X}  SP=0x{sp:08X}  icount={ic}"
 
 
 def uart_tail(n: int = 16384) -> str:
@@ -444,9 +389,9 @@ def set_speed(kips):
 def _build_demo():
     with gr.Blocks(title="FlipperVM Web UI") as demo:
         gr.Markdown(
-            "# 🎛️ FlipperVM v0.3.0 · Web 操作版\n"
-            "> **这是真的虚拟机,不是静态图。** 点「▶ 运行」→ 点 **OK** 立刻进入 iAPP 菜单,\n"
-            "点 ←/→ 切 iAPP (Sub-GHz / NFC),点 **Back** 返回主界面。完全 **不需要 VNC**。"
+            "# 🎛️ FlipperVM · 真实固件 Web 操作版\n"
+            "> **加载官方真实固件 (Momentum v1.1.5)**,在 Unicorn 引擎上运行 STM32WB55 仿真。\n"
+            "固件自动启动,LCD 显示真实启动画面。点「▶ 运行」加速,按键操作设备。"
         )
 
         with gr.Row():
@@ -454,9 +399,9 @@ def _build_demo():
             with gr.Column(scale=5):
                 lcd_out = gr.Image(
                     label="LCD 屏幕 (ST7567 128x64)",
-                    value=lcd_to_pil(_get_vm().display),
+                    value=lcd_to_numpy(_get_vm().display, scale=4),
                     show_label=True,
-                    height=460,
+                    height=400,
                     interactive=False,
                 )
                 with gr.Row(equal_height=True):
@@ -528,12 +473,13 @@ if __name__ == "__main__":
     _get_vm()  # 启动时预热,避免第一次打开页面等太久
     try:
         demo.queue(default_concurrency_limit=16).launch(
-            server_name="127.0.0.1",
+            server_name="0.0.0.0",
             server_port=7860,
+            share=False,
         )
     except TypeError:
         # Gradio 老版本:
         demo.queue().launch(
-            server_name="127.0.0.1",
+            server_name="0.0.0.0",
             server_port=7860,
         )
