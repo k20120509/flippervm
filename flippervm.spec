@@ -62,6 +62,12 @@ for pkg in ('PySide6', 'unicorn'):
 
 hiddenimports += ['unicorn.lib', 'unicorn.unicorn', 'flipper_vm._version']
 
+# ============ 打包固件文件 ============
+# 把 firmware_files 目录打包进 exe,这样 Windows 用户无需额外下载固件
+_firmware_dir = os.path.join(SPECPATH, 'firmware_files')
+if os.path.isdir(_firmware_dir):
+    datas += [(_firmware_dir, 'firmware_files')]
+
 a = Analysis(
     ['main.py'],
     pathex=[],

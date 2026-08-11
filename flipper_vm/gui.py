@@ -283,7 +283,13 @@ class MainWindow(QMainWindow):
             self.vm.step(1000)
         except Exception as e:
             self.console.appendPlainText(f"[vm] 单步异常: {e}")
-            self._pause()
+            # 自愈:尝试复位重启,让用户能继续操作
+            try:
+                if self.vm.firmware is not None:
+                    self.vm.load_firmware(self.vm.firmware)
+                    self.console.appendPlainText("[vm] 单步异常后已自动复位")
+            except Exception:
+                self._pause()
         self.display.update()
         self._refresh_status()
 
@@ -303,12 +309,21 @@ class MainWindow(QMainWindow):
         try:
             self.vm.step(self.instructions_per_frame)
         except Exception as e:
+            # Windows 自愈:Unicorn 在 Windows 上偶发 64 位地址访问违规,
+            # step() 内部已尝试恢复 (跳过指令或重置到 Reset_Handler)。
+            # 如果还是抛到这里,再尝试一次完整复位 + 续跑,
+            # 而不是直接暂停让用户黑屏。
             self.console.appendPlainText(f"[vm] 运行异常: {e}")
-            self._pause()
-            return
-        if self.vm.display.dirty:
-            self.display.update()
-            self.vm.display.clear_dirty()
+            try:
+                if self.vm.firmware is not None:
+                    self.vm.load_firmware(self.vm.firmware)
+                    self.console.appendPlainText("[vm] 已自动复位重启")
+                    # 不暂停,继续运行 —— 让用户看到画面
+            except Exception as e2:
+                self.console.appendPlainText(f"[vm] 自动复位失败: {e2}")
+                self._pause()
+        # 无论是否异常,都刷新屏幕 —— 用户要"不断检测画面"
+        self.display.update()
         self._refresh_status()
         # 卡死检测
         import time

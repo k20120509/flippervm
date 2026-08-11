@@ -1345,6 +1345,14 @@ class FlipperVM:
         if self.firmware is not None:
             entry = (self.firmware.entry_point & 0xFFFFFFFE) | 1
             sp = self.firmware.initial_sp & 0xFFFFFFFF
+            # 关键:清零 SRAM 模拟硬件复位。
+            # PC 落到 SRAM 说明状态已严重损坏 (栈溢出/列表环/任务栈腐败),
+            # 如果不清 SRAM,重启后 crt0 只清 BSS 段,堆和已分配的列表项
+            # 仍带着上一轮的 pxNext/pxPrevious 指针 → vListInsert 自引用环。
+            try:
+                self.uc.mem_write(SRAM1_BASE, b"\x00" * (SRAM1_SIZE + SRAM2_SIZE))
+            except Exception:
+                pass
             self.uc.reg_write(UC_ARM_REG_PC, entry)
             self.uc.reg_write(UC_ARM_REG_SP, sp)
             self.uc.reg_write(UC_ARM_REG_LR, 0xFFFFFFFF)
@@ -1358,6 +1366,15 @@ class FlipperVM:
             self._pendsv_pending = False
             self._systick_pending = False
             self._exc_frame_stack.clear()
+            # 重置列表项清理跟踪:SRAM 已清零,所有列表项都是全新的
+            if hasattr(self, '_vlist_cleaned'):
+                self._vlist_cleaned.clear()
+            if hasattr(self, '_vlist_warn_count'):
+                self._vlist_warn_count = 0
+            self._list_iter_set = set()
+            self._list_break_count = 0
+            self._stuck_loop_pc = 0
+            self._stuck_loop_count = 0
             if self.on_uart_tx and self._warn_64bit_count < 8:
                 self._warn_64bit_count += 1
                 msg = (f"\r\n[VM] RECOVER: PC=0x{pc:08X} invalid, "
@@ -2406,16 +2423,15 @@ class FlipperVM:
             uc.emu_stop()
 
     def _hook_vlist_insert(self, uc, address, size, user_data):
-        """vListInsert 入口钩子:仅在检测到自引用环时清理,避免死循环。
+        """vListInsert 入口钩子:仅在检测到自引用环时干预,避免死循环。
 
         FreeRTOS 正确用法是先 uxListRemove 再 vListInsert。如果临界区保护失效,
         item 仍带有旧的 pxNext/pxPrevious,vListInsert 会创建自引用环导致死循环。
 
         策略:
-          - 只在 item->pxNext == item 或 pxPrevious == item (真正的自引用环) 时干预
-          - 不因为 pxContainer != NULL 就移除 (那是正常的"已在列表中"状态,
-            FreeRTOS 会先用 uxListRemove 再 vListInsert,这是正常流程)
-          - 不跳过函数执行,让固件代码正常完成插入
+          - 第一次检测到自引用环:清理 pxNext/pxPrevious 为 NULL,让 vListInsert 正常插入
+          - 第二次检测到同一个 item 自引用:强制设置 item 为已插入状态并跳过函数
+            (说明 vListInsert 代码本身有 bug 或插入逻辑与自引用环不兼容)
         """
         r0 = uc.reg_read(UC_ARM_REG_R0)  # List_t *
         r1 = uc.reg_read(UC_ARM_REG_R1)  # ListItem_t * (new item)
@@ -2431,22 +2447,75 @@ class FlipperVM:
             return
 
         # 只检测真正的自引用环 (pxNext==item 或 pxPrevious==item)
-        # 这种情况 vListInsert 会无限循环,必须干预
         if pxnext != r1 and pxprev != r1:
             return  # 没有自引用环,让固件正常执行
 
-        # 检测到自引用环 — 清理 item 指针,让 vListInsert 正常插入
-        if self.on_uart_tx and self._warn_64bit_count < 20:
-            self._warn_64bit_count += 1
-            msg = (f"\x0a[VM] self-loop in item 0x{r1:08X}, cleaning\x0a")
+        # 检测到自引用环
+        if not hasattr(self, '_vlist_cleaned'):
+            self._vlist_cleaned = set()
+        if not hasattr(self, '_vlist_warn_count'):
+            self._vlist_warn_count = 0
+
+        if r1 not in self._vlist_cleaned:
+            # 第一次:清理指针,让 vListInsert 正常插入
+            self._vlist_cleaned.add(r1)
+            if self.on_uart_tx and self._vlist_warn_count < 5:
+                self._vlist_warn_count += 1
+                msg = (f"\x0a[VM] self-loop in item 0x{r1:08X}, cleaning\x0a")
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
+            uc.mem_write(r1 + 4, struct.pack("<I", 0))   # pxNext = NULL
+            uc.mem_write(r1 + 8, struct.pack("<I", 0))   # pxPrevious = NULL
+            return
+
+        # 第二次:同一个 item 又自引用 — 强制设置 item 为已插入状态
+        if self.on_uart_tx and self._vlist_warn_count < 10:
+            self._vlist_warn_count += 1
+            msg = (f"\x0a[VM] force-insert item 0x{r1:08X} into list 0x{r0:08X}\x0a")
             for ch in msg:
                 self.on_uart_tx(ord(ch))
 
-        # 清理自引用指针
-        uc.mem_write(r1 + 4, struct.pack("<I", 0))   # pxNext = NULL
-        uc.mem_write(r1 + 8, struct.pack("<I", 0))   # pxPrevious = NULL
-        # 注意:不设置 pxContainer,让 vListInsert 正常设置它
-        # 不跳过函数 — 让固件代码完成正常的插入逻辑
+        # 强制设置 item 为已插入状态:链接到 list 的 xListEnd
+        list_end = r0 + 8  # &xListEnd
+        uc.mem_write(r1 + 4, struct.pack("<I", list_end))    # pxNext = &xListEnd
+        uc.mem_write(r1 + 8, struct.pack("<I", list_end))    # pxPrevious = &xListEnd
+        uc.mem_write(r1 + 0x10, struct.pack("<I", r0))       # pxContainer = list
+        # 更新列表:uxNumberOfItems++
+        try:
+            nitems = struct.unpack("<I", bytes(uc.mem_read(r0, 4)))[0]
+            uc.mem_write(r0, struct.pack("<I", nitems + 1))
+        except Exception:
+            pass
+
+        # 跳过 vListInsert 函数体:扫描返回指令 (bx lr / pop {.., pc} / pop.w)
+        # vListInsert @ 0x08017FC2, 扫描 0x80 字节
+        # 注意:32 位 Thumb 指令需跳过第二个半字,用 while 循环而非 for-range
+        try:
+            code = bytes(uc.mem_read(0x08017FC2, 0x80))
+            i = 0
+            while i < len(code) - 1:
+                hw = code[i] | (code[i + 1] << 8)
+                # 32 位 Thumb 指令前缀:0xE800-0xFFFF (含 pop.w 0xE8BD)
+                is_32 = (hw & 0xF800) >= 0xE800
+                if is_32:
+                    if hw == 0xE8BD and i + 3 < len(code):
+                        # pop.w {rlist, pc}
+                        ret_addr = 0x08017FC2 + i
+                        uc.reg_write(UC_ARM_REG_PC, ret_addr | 1)
+                        return
+                    i += 4  # 跳过整个 32 位指令
+                    continue
+                if hw == 0x4770:  # bx lr
+                    ret_addr = 0x08017FC2 + i
+                    uc.reg_write(UC_ARM_REG_PC, ret_addr | 1)
+                    return
+                if (hw & 0xFF00) == 0xBD00:  # pop {.., pc}
+                    ret_addr = 0x08017FC2 + i
+                    uc.reg_write(UC_ARM_REG_PC, ret_addr | 1)
+                    return
+                i += 2
+        except Exception:
+            pass
 
     # ---------- 中断钩子(处理 SVC/PendSV/EXC_RETURN)----------
     def _hook_intr(self, uc, intno, user_data):

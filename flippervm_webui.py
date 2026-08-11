@@ -183,19 +183,40 @@ def _append_log(msg: str) -> None:
     UART_LOG_CHARS.append("\n")
 
 
+def _find_real_firmware() -> str | None:
+    """查找真实 Flipper 固件文件,跨平台兼容。"""
+    # 搜索顺序:同目录 / firmware_files / firmware_files 子目录 / 上级目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "firmware_files", "momentum-fw-v1.1.5.dfu"),
+        os.path.join(script_dir, "firmware.dfu"),
+        os.path.join(script_dir, "firmware.bin"),
+        # PyInstaller 打包后,_MEIPASS 是临时解压目录
+        os.path.join(getattr(sys, "_MEIPASS", ""), "firmware_files", "momentum-fw-v1.1.5.dfu"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
 def _get_vm() -> FlipperVM:
     global THE_VM
     with VMS_LOCK:
         if THE_VM is None:
             THE_VM = FlipperVM(on_uart_tx=_uart_collector)
             # 优先加载真实固件 (Momentum v1.1.5)
-            real_fw_path = "/workspace/firmware_files/momentum-fw-v1.1.5.dfu"
-            try:
-                fw = load_firmware(real_fw_path)
-                THE_VM.load_firmware(fw)
-                _append_log(f"[VM] Real firmware loaded: {Path(real_fw_path).name} ({len(fw.data)}B)")
-            except Exception as e:
-                _append_log(f"[VM] Failed to load real firmware: {e}, using demo")
+            real_fw_path = _find_real_firmware()
+            if real_fw_path:
+                try:
+                    fw = load_firmware(real_fw_path)
+                    THE_VM.load_firmware(fw)
+                    _append_log(f"[VM] Real firmware loaded: {Path(real_fw_path).name} ({len(fw.data)}B)")
+                except Exception as e:
+                    _append_log(f"[VM] Failed to load real firmware: {e}, using demo")
+                    THE_VM.load_firmware(make_demo_firmware())
+            else:
+                _append_log("[VM] No real firmware found, using demo. Use '加载固件' to load one.")
                 THE_VM.load_firmware(make_demo_firmware())
             THE_VM.display.turn_on()
             # 运行一些指令让固件显示启动画面
@@ -251,12 +272,24 @@ def _run_loop() -> None:
     vm = _get_vm()
     stepsize = max(100, int(RUN_SPEED_KIPS * 1000))
     last_yield = time.time()
+    consecutive_errors = 0
     while not VM_RUN_STOP.is_set():
         try:
             with VM_STEP_LOCK:
                 vm.step(stepsize)
+            consecutive_errors = 0  # 成功执行,清零
         except Exception as e:
             _append_log(f"[VM] step error: {e}")
+            consecutive_errors += 1
+            # Windows 自愈:尝试复位重启继续运行
+            if consecutive_errors < 3 and vm.firmware is not None:
+                try:
+                    with VM_STEP_LOCK:
+                        vm.load_firmware(vm.firmware)
+                    _append_log("[VM] auto-reset after error, continuing")
+                    continue
+                except Exception as e2:
+                    _append_log(f"[VM] auto-reset failed: {e2}")
             break
         now = time.time()
         if now - last_yield > 0.02:
@@ -294,8 +327,10 @@ def press_reset():
         try:
             fw = vm.firmware
             if fw is None:
-                # 重新加载真实固件
-                real_fw_path = "/workspace/firmware_files/momentum-fw-v1.1.5.dfu"
+                # 重新查找真实固件
+                real_fw_path = _find_real_firmware()
+                if real_fw_path is None:
+                    raise FileNotFoundError("No firmware file found")
                 fw = load_firmware(real_fw_path)
             vm.load_firmware(fw)
         except Exception as e:
@@ -314,6 +349,13 @@ def press_step():
             vm.step(1000)
         except Exception as e:
             _append_log(f"[step] error: {e}")
+            # 自愈:尝试复位重启
+            if vm.firmware is not None:
+                try:
+                    vm.load_firmware(vm.firmware)
+                    _append_log("[step] auto-reset after error")
+                except Exception:
+                    pass
     return (refresh_screen(), status_line(), uart_tail(), "单步(1000) 完成")
 
 
