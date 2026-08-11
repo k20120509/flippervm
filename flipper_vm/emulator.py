@@ -1008,7 +1008,7 @@ class FlipperVM:
         self._reg_truncate_counter = 0   # 寄存器截断计数器(周期性截断)
         # Windows 自愈:连续异常恢复计数,超过阈值就真正抛出
         self._recover_count = 0
-        self._recover_reset_threshold = 64  # 连续 64 次恢复后放弃
+        self._recover_reset_threshold = 10  # 连续 10 次恢复后放弃
         self._dwt_cyccnt_base = 0     # DWT cycle counter reset base
         self._stuck_pc = 0            # 卡死检测:上次 PC 页
         self._stuck_count = 0         # 卡死检测:同一 PC 范围连续计数
@@ -1357,6 +1357,7 @@ class FlipperVM:
             self.in_handler = 0
             self._pendsv_pending = False
             self._systick_pending = False
+            self._exc_frame_stack.clear()
             if self.on_uart_tx and self._warn_64bit_count < 8:
                 self._warn_64bit_count += 1
                 msg = (f"\r\n[VM] RECOVER: PC=0x{pc:08X} invalid, "
@@ -1432,15 +1433,22 @@ class FlipperVM:
             until = 0
             batch = remaining
 
+            # 时钟切换等待循环跳过:
+            # 固件在 0x08003D64-0x08003D6C 等待 SWS==0b11 (RM0434 reserved 值)
+            # 仿真返回 SWS=0b10 (PLL),固件永远跳不出去。
+            # 检测 PC 在此循环时,直接跳到循环后的指令 (0x08003D6E)
+            if self.in_handler == 0 and 0x08003D64 <= cur_pc <= 0x08003D6C:
+                self.uc.reg_write(UC_ARM_REG_PC, 0x08003D6E | 1)
+                continue
+
             if self.in_handler > 0:
                 # 在 handler 中:扫描 bx lr / pop {pc} 指令
                 ret_addr = self._find_exc_return_addr(cur_pc)
                 if ret_addr > 0:
                     until = ret_addr
-                    batch = remaining
+                    batch = min(remaining, 5000)
                 else:
-                    # 没找到返回指令,用小批量避免卡死
-                    batch = min(remaining, 100)
+                    batch = min(remaining, 200)
             else:
                 # 线程模式:限制批量大小,确保 DWT_CYCCNT 能及时更新。
                 # 固件使用 DWT_CYCCNT 实现精确延时 (furi_hal_cortex_delay_us),
