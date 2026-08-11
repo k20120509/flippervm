@@ -15,7 +15,9 @@ from unicorn import (
     UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED,
     UC_HOOK_MEM_FETCH_UNMAPPED,
     UC_HOOK_INTR, UC_ERR_OK, UC_PROT_ALL,
+    UC_MEM_WRITE_UNMAPPED, UC_MEM_READ_UNMAPPED,
 )
+from unicorn import UcError
 from unicorn.arm_const import (
     UC_ARM_REG_SP, UC_ARM_REG_PC, UC_ARM_REG_LR,
     UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
@@ -82,10 +84,19 @@ class Peripheral:
         self.regs = bytearray(size)
 
     def read(self, offset: int, size: int) -> int:
+        # 防御:offset 越界时返回 0,避免切片异常
+        if offset < 0 or offset + size > len(self.regs):
+            return 0
         return int.from_bytes(self.regs[offset:offset + size], "little")
 
     def write(self, offset: int, size: int, value: int) -> None:
-        self.regs[offset:offset + size] = value.to_bytes(size, "little")[:size]
+        # 防御:offset 越界时静默丢弃,避免切片异常
+        if offset < 0 or offset + size > len(self.regs):
+            return
+        # 关键:value 可能 >32 位 (Unicorn 在 Windows 上可能传递 64 位值)
+        # 必须先掩码到 size 对应的位数,否则 to_bytes 会抛 OverflowError
+        mask = (1 << (8 * size)) - 1
+        self.regs[offset:offset + size] = (value & mask).to_bytes(size, "little")
 
 
 class GPIO(Peripheral):
@@ -117,6 +128,8 @@ class GPIO(Peripheral):
         return super().read(offset, size)
 
     def write(self, offset, size, value):
+        # 防御:value 可能 >32 位 (Unicorn Windows bug),先掩码
+        value &= 0xFFFFFFFF
         if offset == self.BSRR:
             odr = int.from_bytes(self.regs[self.ODR:self.ODR + 4], "little")
             if value & 0xFFFF0000:
@@ -273,7 +286,7 @@ class RCC(Peripheral):
     # CRRCR 位定义
     HSI48RDY = 1 << 1    # HSI48 ready (USB/RNG clock)
     # CFGR SWS 位
-    SWS_PLL  = 0b11 << 2  # System clock switch status: PLL
+    SWS_PLL  = 0b10 << 2  # System clock switch status: PLL (RM0434: SWS=0b10 for PLL, 0b11 is reserved!)
 
     def __init__(self, base, size, name="RCC"):
         super().__init__(base, size, name)
@@ -327,10 +340,19 @@ class RCC(Peripheral):
             val = int.from_bytes(self.regs[self.CSR:self.CSR + 4], "little")
             val |= self.LSI1RDY
             return val & 0xFFFFFFFF
-        # CFGR: 返回当前系统时钟源为 PLL (SWS=0b11)
+        # CFGR: SWS 跟随 SW,但 SW=0b11 时映射为 0b10 (PLL)。
+        #   固件写 SW=0b11 并轮询 SWS 等待 == 0b11。
+        #   但 SWS=0b11 会导致 PendSV 上下文切换异常(任务栈损坏)。
+        #   策略:SW=0b11 时返回 SWS=0b10,固件检测到 SWS!=0b11 会
+        #   跳过等待继续执行(部分固件版本接受 SWS=PLL 作为已切换)。
+        #   如果固件严格要求 SWS==0b11,会进入超时循环但不会崩溃。
         if offset == self.CFGR:
             val = int.from_bytes(self.regs[self.CFGR:self.CFGR + 4], "little")
-            val |= self.SWS_PLL
+            sw = val & 0x03           # SW = bits[1:0]
+            if sw == 0b11:            # reserved → 当作 PLL
+                sw = 0b10
+            val &= ~(0x03 << 2)       # 清 SWS
+            val |= (sw << 2)          # SWS = SW (切换完成)
             if size == 4:
                 return val
             elif size == 2:
@@ -386,7 +408,10 @@ class IPCC(Peripheral):
     """STM32WB55 IPCC (Inter-Processor Communication Controller) 仿真。
 
     Flipper Zero 固件在启动 CPU2 (Radio) 后,会通过 IPCC 寄存器等待 CPU2 应答。
-    我们把所有"通道空闲/待处理"状态位模拟成已就绪,防止死循环。
+    由于 CPU2 未仿真,当 CPU1 通过 CPU1TOC2SR 发送消息时,自动模拟 CPU2 的响应:
+    - 清除 CPU1TOC2SR 对应位 (CPU2 已接收)
+    - 设置 CPU2TOC1SR 对应位 (CPU2 已回复)
+    - 如果该通道中断未屏蔽,pend IPCC IRQ
     """
     CPU1CR = 0x00
     CPU1MR = 0x04
@@ -399,12 +424,45 @@ class IPCC(Peripheral):
     CPU2TOC1SR = 0x2C   # CPU2 To CPU1 Status Register
     CPU2TOC1MR = 0x30
 
+    def __init__(self, base, size, name="IPCC"):
+        super().__init__(base, size, name)
+        self._vm = None
+        self._irq = None  # IPCC RX IRQ number (set by FlipperVM)
+
     def read(self, offset, size):
         val = int.from_bytes(self.regs[offset:offset + size], "little")
-        # CPU2TOC1SR: CPU2 -> CPU1 消息都标记为空闲(bit=0 表示 free)
-        # CPU1TOC2SR: CPU1 -> CPU2 通道也都标记为 free
-        # 关键:如果 Flipper 固件轮询 CPU2TOC1SR 等待某个通道被 CPU2 释放,返回全 0 = 全部空闲
         return val & 0xFFFFFFFF
+
+    def write(self, offset, size, value):
+        mask = (1 << (8 * size)) - 1
+        value &= mask
+
+        # CPU1 向 CPU2 发送消息:写 CPU1TOC2SR 设置 bit = 通知 CPU2
+        if offset == self.CPU1TOC2SR:
+            old = int.from_bytes(self.regs[self.CPU1TOC2SR:self.CPU1TOC2SR + 4], "little")
+            new_channels = value & ~old  # 新设置的通道
+            if new_channels:
+                # 清除 CPU1->CPU2 状态 (CPU2 已接收)
+                self.regs[self.CPU1TOC2SR:self.CPU1TOC2SR + 4] = (old & ~value).to_bytes(4, "little")
+                # 设置 CPU2->CPU1 状态 (CPU2 已回复)
+                c2toc1 = int.from_bytes(self.regs[self.CPU2TOC1SR:self.CPU2TOC1SR + 4], "little")
+                c2toc1 |= new_channels
+                self.regs[self.CPU2TOC1SR:self.CPU2TOC1SR + 4] = c2toc1.to_bytes(4, "little")
+                # 检查中断屏蔽:CPU2TOC1MR 中 0 = 未屏蔽(允许中断)
+                c2mr = int.from_bytes(self.regs[self.CPU2TOC1MR:self.CPU2TOC1MR + 4], "little")
+                unmasked = new_channels & ~c2mr
+                if unmasked and self._vm is not None and self._irq is not None:
+                    self._vm._pend_irq(self._irq)
+            return
+
+        # CPU1 清除 CPU2->CPU1 状态 (确认收到 CPU2 回复):写 CPU2TOC1SR 清 bit
+        if offset == self.CPU2TOC1SR:
+            old = int.from_bytes(self.regs[self.CPU2TOC1SR:self.CPU2TOC1SR + 4], "little")
+            self.regs[self.CPU2TOC1SR:self.CPU2TOC1SR + 4] = (old & ~value).to_bytes(4, "little")
+            return
+
+        # 其他寄存器直接写
+        self.regs[offset:offset + size] = value.to_bytes(size, "little")
 
 
 class HWSEM(Peripheral):
@@ -559,18 +617,73 @@ class SYSCFG(Peripheral):
 
 class LPTIM(Peripheral):
     """STM32WB55 LPTIM (Low-Power Timer) 仿真。
-    返回 ISR=0 (无事件), 防止固件死等。
+
+    真实推进 CNT: 每调用 advance(N) 就让 CNT += N,到达 ARR 后置 ARRM。
+    这样固件 LPTIM 睡眠不会卡死。
     """
-    ISR = 0x00
-    IER = 0x04
+    ISR  = 0x00   # Interrupt and Status: ARRM=bit4 ARROK=bit5 UP=bit6 DOWN=bit7
+    IER  = 0x04   # Interrupt Enable: ARRIE=bit4
     CFGR = 0x08
-    CR = 0x0C
+    CR   = 0x0C   # Control: ENABLE=bit0 SNGSTRT=bit2 CNTSTRT=bit1
+    CMP  = 0x10
+    ARR  = 0x14
+    CNT  = 0x18
+
+    def __init__(self, base, size, name="LPTIM"):
+        super().__init__(base, size, name)
+        self._cnt = 0
+        self._arr = 0x0000FFFF
+        # IRQ 号: STM32WB55 RM0434 中 LPTIM1=IRQ31, LPTIM2=IRQ32.
+        # 若名字里有 "2" 则 +1
+        self._irq = 31 + (1 if "2" in name else 0)
+        self._vm = None  # 由 FlipperVM 注入,用于触发 NVIC
 
     def read(self, offset, size):
-        val = int.from_bytes(self.regs[offset:offset + size], "little")
-        if offset == self.ISR:
-            return 0  # 无事件
-        return val
+        if offset == self.CNT:
+            # 把当前 CNT 同步回 regs 供读
+            self._cnt &= 0xFFFF
+            self.regs[self.CNT:self.CNT + 4] = self._cnt.to_bytes(4, "little")
+            return self._cnt
+        if offset == self.ARR:
+            return self._arr
+        return super().read(offset, size)
+
+    def write(self, offset, size, value):
+        super().write(offset, size, value)
+        if offset == self.ARR:
+            self._arr = value & 0xFFFF
+            if self._arr == 0:
+                self._arr = 1  # 防止除以 0
+        # 只要 IER 开启了任何中断,同时兜底把 NVIC ISER 对应位打开,
+        # 保证 WFI 等中断睡眠能被唤醒(即使固件漏开 NVIC)
+        if offset == self.IER and self._vm is not None:
+            if value & 0x3F:
+                iser_idx = self._irq // 32
+                iser_bit = 1 << (self._irq % 32)
+                if iser_idx < len(self._vm.nvic_iser):
+                    self._vm.nvic_iser[iser_idx] |= iser_bit
+
+    def advance(self, cycles: int) -> bool:
+        """让定时器前进一步,返回是否产生了 ARRM 事件。"""
+        cr = int.from_bytes(self.regs[self.CR:self.CR + 4], "little")
+        if not (cr & 0x01):  # ENABLE == 0
+            return False
+        # CNTSTRT/SNGSTRT 启动了就递增
+        self._cnt = (self._cnt + cycles) & 0xFFFFFFFF
+        arrm = False
+        while self._cnt >= self._arr:
+            self._cnt -= self._arr
+            arrm = True
+        if arrm:
+            # ISR.ARRM = bit4
+            isr = int.from_bytes(self.regs[self.ISR:self.ISR + 4], "little")
+            self.regs[self.ISR:self.ISR + 4] = (isr | (1 << 4)).to_bytes(4, "little")
+            # 如果 IER.ARRIE=1,且有 VM 引用,触发 NVIC
+            ier = int.from_bytes(self.regs[self.IER:self.IER + 4], "little")
+            if (ier & (1 << 4)) and self._vm is not None:
+                self._vm._pend_irq(self._irq)
+            return True
+        return False
 
 
 class LPUART(Peripheral):
@@ -598,6 +711,96 @@ class LPUART(Peripheral):
                 self.on_tx(value & 0xFF)
             return
         super().write(offset, size, value)
+
+
+class DMA1(Peripheral):
+    """STM32WB55 DMA1 控制器仿真。
+
+    支持 memory-to-peripheral 传输(用于 SPI2 TX 发送 LCD 数据)。
+    当通道使能时,立即执行传输:从内存读取数据,写入目标外设寄存器。
+    """
+    # DMA1 寄存器布局 (每个通道 0x20 字节)
+    ISR   = 0x00  # Interrupt Status (低16位: 4位/通道 x 7通道)
+    IFCR  = 0x04  # Interrupt Flag Clear
+    # 通道寄存器 (偏移 = ch * 0x20):
+    CCR   = 0x00  # Control: EN=bit0, TCIE=bit1, MINC=bit4, DIR=bit5(0=M→P)
+    CNDTR = 0x04  # Count
+    CPAR  = 0x08  # Peripheral address
+    CMAR  = 0x0C  # Memory address
+
+    def __init__(self, base, size, name="DMA1"):
+        super().__init__(base, size, name)
+        self._vm = None
+
+    def write(self, offset, size, value):
+        mask = (1 << (8 * size)) - 1
+        value &= mask
+        self.regs[offset:offset + size] = value.to_bytes(size, "little")
+
+        # 检测通道使能: CCR 的 EN 位 (bit0) 被设置
+        # 通道 0 的 CCR 在 offset 0x08+0*0x20 = 0x08
+        # 通道 1 的 CCR 在 offset 0x08+1*0x20 = 0x28
+        # 通道 N 的 CCR 在 offset 0x08+N*0x20
+        for ch in range(7):
+            ccr_off = 0x08 + ch * 0x20
+            if offset == ccr_off and (value & 1):
+                self._execute_channel(ch)
+
+    def _execute_channel(self, ch):
+        """立即执行 DMA 通道传输。"""
+        base = 0x08 + ch * 0x20
+        ccr = int.from_bytes(self.regs[base:self.CCR + 4 - 0x08 + base], "little") if False else \
+              int.from_bytes(self.regs[base:base + 4], "little")
+        cndtr = int.from_bytes(self.regs[base + 4:base + 8], "little")
+        cpar = int.from_bytes(self.regs[base + 8:base + 12], "little")
+        cmar = int.from_bytes(self.regs[base + 12:base + 16], "little")
+
+        if cndtr == 0 or cpar == 0:
+            # 禁用通道
+            self.regs[base:base + 4] = (ccr & ~1).to_bytes(4, "little")
+            return
+
+        # DIR: 0 = read from memory, write to peripheral
+        # DIR: 1 = read from peripheral, write to memory
+        dir_mem_to_periph = not (ccr & (1 << 5))
+        minc = ccr & (1 << 4)  # Memory increment
+        psize = (ccr >> 8) & 0x3  # Peripheral size: 0=8bit, 1=16bit, 2=32bit
+        msize = (ccr >> 10) & 0x3  # Memory size
+
+        byte_size = 1 << psize if dir_mem_to_periph else 1 << msize
+
+        try:
+            if dir_mem_to_periph:
+                # Memory → Peripheral: 读取内存数据,写入外设
+                for i in range(cndtr):
+                    addr = cmar + (i * (1 << msize) if minc else 0)
+                    data = int.from_bytes(
+                        bytes(self._vm.uc.mem_read(addr, 1 << msize)), "little")
+                    # 写入外设:通过 VM 的内存写钩子
+                    self._vm.uc.mem_write(cpar, data.to_bytes(1 << psize, "little"))
+            else:
+                # Peripheral → Memory: 读取外设,写入内存
+                for i in range(cndtr):
+                    data = int.from_bytes(
+                        bytes(self._vm.uc.mem_read(cpar, 1 << psize)), "little")
+                    addr = cmar + (i * (1 << msize) if minc else 0)
+                    self._vm.uc.mem_write(addr, data.to_bytes(1 << msize, "little"))
+        except Exception:
+            pass
+
+        # 传输完成:清除 EN,设置 TCIF (Transfer Complete Interrupt Flag)
+        self.regs[base:base + 4] = (ccr & ~1).to_bytes(4, "little")
+        # ISR: 每通道 4 位,TCIF = bit1 (在通道的 4 位组内)
+        isr = int.from_bytes(self.regs[0:4], "little")
+        tcif_bit = 1 << (ch * 4 + 1)  # TCIF = GIF bit1
+        isr |= tcif_bit
+        self.regs[0:4] = isr.to_bytes(4, "little")
+
+        # 如果 TCIE 使能,pend DMA 中断
+        if ccr & (1 << 1) and self._vm is not None:
+            # DMA1 通道中断号: ch 0=11, ch1=12, ..., ch6=17
+            irq = 11 + ch
+            self._vm._pend_irq(irq)
 
 
 class TSC(Peripheral):
@@ -722,7 +925,7 @@ class FlipperVM:
         self.pwr = PWR(PWR_BASE, 0x100, "PWR")
         self.flash_reg = FLASHController(FLASH_REG_BASE, 0x200, "FLASH")
         self.rng = RNG(RNG_BASE, 0x100, "RNG")
-        self.dma1 = Peripheral(DMA1_BASE, 0x400, "DMA1")
+        self.dma1 = DMA1(DMA1_BASE, 0x400, "DMA1")
         self.dmamux = Peripheral(DMAMUX1_BASE, 0x100, "DMAMUX1")
         self.crc = Peripheral(CRC_BASE, 0x40, "CRC")
         self.adc = Peripheral(ADC_BASE, 0x400, "ADC")
@@ -745,6 +948,15 @@ class FlipperVM:
         self.lpuart1 = LPUART(LPUART1_BASE, "LPUART1", on_uart_tx)
         self.lptim1 = LPTIM(LPTIM1_BASE, 0x100, "LPTIM1")
         self.lptim2 = LPTIM(LPTIM2_BASE, 0x100, "LPTIM2")
+        # LPTIM 需要反向引用 VM 以便触发 NVIC 中断
+        self.lptim1._vm = self
+        self.lptim2._vm = self
+        # IPCC 也需要反向引用 VM 以便触发 NVIC 中断
+        # STM32WB55: IPCC_C1_RX_IRQn = 35, IPCC_C1_TX_IRQn = 34
+        self.ipcc._vm = self
+        self.ipcc._irq = 35  # IPCC_C1_RX_IRQn
+        # DMA1 需要反向引用 VM 以便执行内存→外设传输和触发中断
+        self.dma1._vm = self
         self.tsc = TSC(TSC_BASE, "TSC")
         self.vrefbuf = VREFBUF(VREFBUF_BASE, 0x40, "VREFBUF")
 
@@ -786,9 +998,17 @@ class FlipperVM:
         self._systick_countflag = False  # COUNTFLAG (bit 16 of CTRL)
         self.in_handler = 0   # 当前处于异常处理层数
         self._exc_return_psp = False  # 异常返回时是否使用 PSP
+        self._exc_frame_stack = []  # 异常帧指针栈:每层 handler 进入时记录帧 SP
+        self._handler_instr_count = 0  # handler 内执行的指令计数(用于超时检测)
         self._pendsv_pending = False  # PendSV pending (FreeRTOS 上下文切换)
         self._systick_pending = False  # SysTick pending (SCB_ICSR.PENDSTSET)
         self._emu_stopped_early = False  # emu_start 被 emu_stop 提前终止(异常返回)
+        self._skip_current_instr = False  # 跳过当前指令(64位地址访问后)
+        self._warn_64bit_count = 0       # 64位地址警告计数(限流)
+        self._reg_truncate_counter = 0   # 寄存器截断计数器(周期性截断)
+        # Windows 自愈:连续异常恢复计数,超过阈值就真正抛出
+        self._recover_count = 0
+        self._recover_reset_threshold = 64  # 连续 64 次恢复后放弃
         self._dwt_cyccnt_base = 0     # DWT cycle counter reset base
         self._stuck_pc = 0            # 卡死检测:上次 PC 页
         self._stuck_count = 0         # 卡死检测:同一 PC 范围连续计数
@@ -862,12 +1082,27 @@ class FlipperVM:
         self._list_break_count = 0
         self._loop_pc_page = 0
         self._stuck_logged = False
+        self._skip_current_instr = False
+        self._warn_64bit_count = 0
+        self._reg_truncate_counter = 0
+        self._recover_count = 0
         # 设置初始 SP 与 PC
         self.uc.reg_write(UC_ARM_REG_SP, fw.initial_sp & 0xFFFFFFFF)
         # Cortex-M:PC 的 bit0 必须为 1 以表示 Thumb 状态
         self.uc.reg_write(UC_ARM_REG_PC, (fw.entry_point & 0xFFFFFFFE) | 1)
         # CPSR:Thumb(bit5)+ Supervisor 模式(bit0-4=0x13)
         self.uc.reg_write(UC_ARM_REG_CPSR, 0x00000023)
+        # 关键:显式清零所有通用寄存器,防止 Windows 上 Unicorn
+        # 初始寄存器值带 >32 位的垃圾位导致地址计算错误
+        for reg in (UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+                    UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+                    UC_ARM_REG_R8, UC_ARM_REG_R12, UC_ARM_REG_LR):
+            self.uc.reg_write(reg, 0)
+        # MSP/PSP 也确保 32 位
+        self.uc.reg_write(UC_ARM_REG_MSP, fw.initial_sp & 0xFFFFFFFF)
+        self.uc.reg_write(UC_ARM_REG_PSP, 0)
+        self.uc.reg_write(UC_ARM_REG_PRIMASK, 0)
+        self.uc.reg_write(UC_ARM_REG_BASEPRI, 0)
         # 设置 VTOR 指向 Flash 起始(在 PPB 中)
         vtor = FLASH_BASE
         self.ppb[SCB_VTOR - PPB_BASE:SCB_VTOR - PPB_BASE + 4] = vtor.to_bytes(4, "little")
@@ -973,10 +1208,36 @@ class FlipperVM:
         gpio_base, pin_bit = BUTTON_MAP[name]
         gpio = self.peripherals[gpio_base]
         gpio.set_button(pin_bit, pressed)
-        # 产生 EXTI 下降沿中断(按键 IRQ 号 = pin 号,PB/PC 引脚号)
-        # 这里只把 pending 置位,实际触发由主循环决定
+        # pin_no = EXTI 线号 = GPIO 引脚号 (0-5) = NVIC IRQ 号 (0-5)
+        pin_no = {1: 0, 2: 1, 4: 2, 8: 3, 0x10: 4, 0x20: 5}.get(
+            pin_bit, max(0, pin_bit.bit_length() - 1)
+        )
         if pressed:
-            pin_no = {1: 0, 2: 1, 4: 2, 8: 3, 0x10: 4, 0x20: 5}.get(pin_bit, pin_bit.bit_length() - 1)
+            # 确保 NVIC ISER 使能了该 IRQ(即便固件还没初始化也能进中断)
+            iser_idx = pin_no // 32
+            iser_bit = 1 << (pin_no % 32)
+            self.nvic_iser[iser_idx] |= iser_bit
+            # 同时使能 EXTI IMR (中断屏蔽) 和 FTSR (下降沿触发)
+            # 真实固件通常通过 HAL_GPIO_Init / HAL_EXTI_SetConfigLine 设置,
+            # 但如果还没设置,我们手动兜底:
+            exti_imr_off, exti_ftsr_off = 0x00, 0x0C  # EXTI_IMR / EXTI_FTSR1
+            try:
+                imr = int.from_bytes(self.exti.regs[exti_imr_off:exti_imr_off + 4], "little")
+                self.exti.regs[exti_imr_off:exti_imr_off + 4] = \
+                    (imr | (1 << pin_no)).to_bytes(4, "little")
+                ftsr = int.from_bytes(self.exti.regs[exti_ftsr_off:exti_ftsr_off + 4], "little")
+                self.exti.regs[exti_ftsr_off:exti_ftsr_off + 4] = \
+                    (ftsr | (1 << pin_no)).to_bytes(4, "little")
+            except Exception:
+                pass
+            # EXTI Pending Register 置位 (模拟下降沿到达)
+            exti_pr1_off = 0x14
+            try:
+                self.exti.regs[exti_pr1_off:exti_pr1_off + 4] = \
+                    (1 << pin_no).to_bytes(4, "little")
+            except Exception:
+                pass
+            # 最后 pend 中断到 NVIC
             self._pend_irq(pin_no)
 
     # ---------- 主执行循环 ----------
@@ -1004,6 +1265,107 @@ class FlipperVM:
                 if hw2 & 0x8000:  # bit 15 = PC
                     return start_pc + i
         return 0
+
+    def _thumb_instr_size(self, pc: int) -> int:
+        """返回 PC 处 Thumb 指令的大小 (2 或 4 字节)。
+
+        Thumb-2 32 位指令的第一个半字 bits[15:11] 为:
+          0b11101 (0xE800-0xEFFF), 0b11110 (0xF000-0xF7FF), 0b11111 (0xF800-0xFFFF)
+        其他为 16 位指令。
+        """
+        try:
+            code = bytes(self.uc.mem_read(pc & ~1, 2))
+            hw = code[0] | (code[1] << 8)
+            if (hw & 0xF800) >= 0xE800:
+                return 4
+            return 2
+        except Exception:
+            return 2  # 默认 2 字节
+
+    def _truncate_registers(self) -> None:
+        """将所有 ARM 寄存器截断到 32 位。
+
+        Windows 上 Unicorn 可能不自动截断寄存器到 32 位,
+        导致地址计算产生 >32 位的地址。定期调用此方法清除高位垃圾。
+        """
+        try:
+            for reg in (UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+                        UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+                        UC_ARM_REG_R8, UC_ARM_REG_R12, UC_ARM_REG_LR,
+                        UC_ARM_REG_SP, UC_ARM_REG_PC):
+                val = self.uc.reg_read(reg)
+                if val > 0xFFFFFFFF:
+                    self.uc.reg_write(reg, val & 0xFFFFFFFF)
+            # MSP/PSP 也截断
+            msp = self.uc.reg_read(UC_ARM_REG_MSP)
+            if msp > 0xFFFFFFFF:
+                self.uc.reg_write(UC_ARM_REG_MSP, msp & 0xFFFFFFFF)
+            psp = self.uc.reg_read(UC_ARM_REG_PSP)
+            if psp > 0xFFFFFFFF:
+                self.uc.reg_write(UC_ARM_REG_PSP, psp & 0xFFFFFFFF)
+        except Exception:
+            pass
+
+    def _try_skip_instruction(self, pc: int, err_msg: str) -> bool:
+        """尝试跳过当前指令以从访问违规中恢复。
+
+        在 Windows 上,Unicorn 可能产生 >32 位地址访问导致崩溃。
+        策略:
+          1. PC 在真实 Flash 可执行区 (0x08000000-0x08100000):
+             截断所有寄存器到 32 位,然后跳过当前指令 (PC += 指令长度)
+          2. PC 无效 (0 / >32 位 / 不在 Flash):
+             如果有固件,重置 PC=Reset_Handler, SP=initial_sp, 清零寄存器,
+             让固件从头重启 —— 这能清除任何残留的 64 位垃圾值
+          3. 没有固件:放弃
+
+        返回 True 如果成功恢复 (无论跳过还是重置)。
+        """
+        # PC >32 位:截断后重新判断
+        if pc > 0xFFFFFFFF:
+            pc32 = pc & 0xFFFFFFFF
+            self.uc.reg_write(UC_ARM_REG_PC, pc32 | 1)
+            pc = pc32
+
+        # 策略 1:PC 在真实 Flash 可执行区,跳过当前指令
+        if 0x08000000 <= pc < 0x08100000:
+            skip = self._thumb_instr_size(pc)
+            new_pc = (pc + skip) | 1
+            self.uc.reg_write(UC_ARM_REG_PC, new_pc)
+            self._truncate_registers()
+            if self.on_uart_tx and self._warn_64bit_count < 5:
+                self._warn_64bit_count += 1
+                msg = f"\r\n[VM] RECOVER: skip instr @0x{pc:08X} ({err_msg[:60]})\r\n"
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
+            return True
+
+        # 策略 2:PC 无效 (0 / 在向量表 / 在 SRAM 执行等) —— 重置到 Reset_Handler
+        # 注意:地址 0 虽然映射了 Flash 别名,但 PC=0 通常意味着异常处理已把状态搞坏,
+        # 在向量表里"跳过指令"只会越走越乱 (用户报告的 PC=0 死循环就是这种情况)。
+        if self.firmware is not None:
+            entry = (self.firmware.entry_point & 0xFFFFFFFE) | 1
+            sp = self.firmware.initial_sp & 0xFFFFFFFF
+            self.uc.reg_write(UC_ARM_REG_PC, entry)
+            self.uc.reg_write(UC_ARM_REG_SP, sp)
+            self.uc.reg_write(UC_ARM_REG_LR, 0xFFFFFFFF)
+            self.uc.reg_write(UC_ARM_REG_MSP, sp)
+            self.uc.reg_write(UC_ARM_REG_PSP, 0)
+            for reg in (UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+                        UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+                        UC_ARM_REG_R8, UC_ARM_REG_R12):
+                self.uc.reg_write(reg, 0)
+            self.in_handler = 0
+            self._pendsv_pending = False
+            self._systick_pending = False
+            if self.on_uart_tx and self._warn_64bit_count < 8:
+                self._warn_64bit_count += 1
+                msg = (f"\r\n[VM] RECOVER: PC=0x{pc:08X} invalid, "
+                       f"reset to Reset_Handler 0x{entry:08X}\r\n")
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
+            return True
+
+        return False
 
     def step(self, n_instructions: int = 1000) -> None:
         """执行 N 条指令,期间检查 SysTick / PendSV / pending IRQ。
@@ -1036,8 +1398,9 @@ class FlipperVM:
                 primask = self.uc.reg_read(UC_ARM_REG_PRIMASK)
                 basepri = self.uc.reg_read(UC_ARM_REG_BASEPRI)
                 # SysTick 和 PendSV 的优先级从 SHPR3 读取
-                # SHPR3: [31:24]=SysTick, [23:16]=PendSV
-                shpr3 = int.from_bytes(self.ppb[SCB_SHPR + 4 - PPB_BASE:SCB_SHPR + 8 - PPB_BASE], "little")
+                # SHPR1=0xE000ED18 (exc 4-7), SHPR2=0xE000ED1C (exc 8-11),
+                # SHPR3=0xE000ED20 (exc 12-15): [31:24]=SysTick(15), [23:16]=PendSV(14)
+                shpr3 = int.from_bytes(self.ppb[SCB_SHPR + 8 - PPB_BASE:SCB_SHPR + 12 - PPB_BASE], "little")
                 systick_prio = (shpr3 >> 24) & 0xFF
                 pendsv_prio = (shpr3 >> 16) & 0xFF
 
@@ -1087,6 +1450,40 @@ class FlipperVM:
 
             try:
                 self.uc.emu_start(begin, until, timeout=0, count=batch)
+                # 成功执行一批指令,清零恢复计数
+                self._recover_count = 0
+            except UcError as e:
+                # Windows 兼容:Unicorn 在 Windows 上可能产生 >32 位地址访问
+                # 导致 "access violation" 错误。尝试跳过当前指令继续执行。
+                err_msg = str(e)
+                if "access violation" in err_msg or "UC_ERR_WRITE_UNMAPPED" in err_msg \
+                   or "UC_ERR_READ_UNMAPPED" in err_msg or "UC_ERR_FETCH_UNMAPPED" in err_msg \
+                   or "UC_ERR_INSN_INVALID" in err_msg:
+                    pc = self.uc.reg_read(UC_ARM_REG_PC)
+                    # 先截断所有寄存器,清除可能导致 64 位地址的高位垃圾
+                    self._truncate_registers()
+                    if self._try_skip_instruction(pc, err_msg):
+                        self._recover_count += 1
+                        if self._recover_count < self._recover_reset_threshold:
+                            # 恢复成功,继续执行(消耗 1 条指令配额)
+                            executed = 1
+                            self.icount += executed
+                            remaining -= executed
+                            self._check_systick(executed)
+                            continue
+                        # 连续恢复次数过多 —— 真正抛出,让上层处理
+                        if self.on_uart_tx:
+                            msg = (f"\r\n[FlipperVM] Too many recoveries "
+                                   f"({self._recover_count}), giving up: {e}\r\n")
+                            for ch in msg:
+                                self.on_uart_tx(ord(ch))
+                self.running = False
+                if self.on_uart_tx:
+                    pc = self.uc.reg_read(UC_ARM_REG_PC)
+                    msg = f"\r\n[FlipperVM] CPU exception: {e}\r\n[FlipperVM] PC=0x{pc:08X}\r\n"
+                    for ch in msg:
+                        self.on_uart_tx(ord(ch))
+                raise
             except Exception as e:
                 self.running = False
                 if self.on_uart_tx:
@@ -1096,8 +1493,30 @@ class FlipperVM:
                         self.on_uart_tx(ord(ch))
                 raise
 
+            # 检查是否需要跳过当前指令 (64位地址访问后由 _handle_64bit_access 设置)
+            if self._skip_current_instr:
+                self._skip_current_instr = False
+                pc = self.uc.reg_read(UC_ARM_REG_PC)
+                skip = self._thumb_instr_size(pc)
+                new_pc = (pc + skip) | 1
+                self.uc.reg_write(UC_ARM_REG_PC, new_pc)
+                executed = 1
+                self.icount += executed
+                remaining -= executed
+                self._check_systick(executed)
+                # 跳过后截断所有寄存器到 32 位,清除可能残留的高位
+                self._truncate_registers()
+                continue
+
             new_pc = self.uc.reg_read(UC_ARM_REG_PC)
             new_sp = self.uc.reg_read(UC_ARM_REG_SP)
+
+            # 周期性截断寄存器到 32 位 (每 5000 条指令)
+            # 防止 Windows 上 Unicorn 寄存器高位积累垃圾值
+            self._reg_truncate_counter += batch
+            if self._reg_truncate_counter >= 5000:
+                self._reg_truncate_counter = 0
+                self._truncate_registers()
 
             # 检查是否到达了异常返回指令
             if until > 0 and new_pc == until and self.in_handler > 0:
@@ -1128,8 +1547,8 @@ class FlipperVM:
             self._check_systick(executed)
 
             # ===== 卡死循环检测与恢复 =====
-            # 当 PC 长时间停留在同一小范围时,可能是链表环或外设轮询卡死。
-            # 检测并尝试恢复:对 vListInsert 的自引用环,跳过插入。
+            # 线程模式:使用 256B 块检测紧密循环
+            # Handler 模式:使用指令计数超时检测
             if self.in_handler == 0:
                 pc_block = new_pc & ~0xFF  # 256 字节块
                 if pc_block == self._stuck_loop_pc:
@@ -1143,6 +1562,51 @@ class FlipperVM:
                     if recovered:
                         self._stuck_loop_pc = 0
                         self._stuck_loop_count = 0
+            else:
+                # Handler 模式:跟踪 handler 内执行的指令总数
+                # 如果超过 100K 条还没返回,认为 handler 卡死
+                self._handler_instr_count += executed
+                if self._handler_instr_count >= 100000:
+                    # 尝试 vListInsert 恢复
+                    recovered = self._recover_stuck_loop(new_pc)
+                    if recovered:
+                        self._handler_instr_count = 0
+                    elif self._exc_frame_stack:
+                        # 强制从异常帧恢复,返回被中断的线程代码
+                        frame_sp, exc_return = self._exc_frame_stack[-1]
+                        try:
+                            frame = self.uc.mem_read(frame_sp, 32)
+                            r0, r1, r2, r3, r12, lr, pc_val, xpsr = struct.unpack("<IIIIIIII", frame)
+                            # 验证恢复的 PC 在有效范围内
+                            if 0x08000000 <= pc_val <= 0x08300000:
+                                self.uc.reg_write(UC_ARM_REG_R0, r0)
+                                self.uc.reg_write(UC_ARM_REG_R1, r1)
+                                self.uc.reg_write(UC_ARM_REG_R2, r2)
+                                self.uc.reg_write(UC_ARM_REG_R3, r3)
+                                self.uc.reg_write(UC_ARM_REG_R12, r12)
+                                self.uc.reg_write(UC_ARM_REG_LR, lr)
+                                self.uc.reg_write(UC_ARM_REG_PC, pc_val | 1)
+                                self.uc.reg_write(UC_ARM_REG_XPSR, xpsr & 0xF8000000 | (1 << 24))
+                                new_sp = frame_sp + 32
+                                if exc_return == 0xFFFFFFFD:
+                                    self.uc.reg_write(UC_ARM_REG_PSP, new_sp)
+                                else:
+                                    self.uc.reg_write(UC_ARM_REG_MSP, new_sp)
+                                self.uc.reg_write(UC_ARM_REG_SP, new_sp)
+                                self._exc_frame_stack.pop()
+                                self.in_handler -= 1
+                                self._handler_instr_count = 0
+                                # 清除 BASEPRI 和 SysTick pending
+                                # handler 卡死说明 FreeRTOS 临界区状态损坏,
+                                # 清除 BASEPRI 让 PendSV 能正常派发
+                                self.uc.reg_write(UC_ARM_REG_BASEPRI, 0)
+                                self._systick_pending = False
+                                if self.on_uart_tx:
+                                    msg = "[VM] Handler timeout, restored PC=0x%08X\n" % pc_val
+                                    for ch in msg:
+                                        self.on_uart_tx(ord(ch))
+                        except Exception:
+                            pass
 
     def _recover_stuck_loop(self, pc: int) -> bool:
         """检测并恢复卡死循环。
@@ -1154,8 +1618,8 @@ class FlipperVM:
 
         返回 True 如果成功恢复。
         """
-        # vListInsert 循环范围:0x08017FE0 - 0x08017FEE
-        if 0x08017FE0 <= pc <= 0x08017FEE:
+        # vListInsert 循环范围:0x08017FC0 - 0x08018010 (整个函数体)
+        if 0x08017FC0 <= pc <= 0x08018010:
             r0 = self.uc.reg_read(UC_ARM_REG_R0)  # List_t *
             r1 = self.uc.reg_read(UC_ARM_REG_R1)  # ListItem_t * (new item)
             if r1 and 0x20000000 <= r1 < 0x20040000 and \
@@ -1163,21 +1627,41 @@ class FlipperVM:
                 try:
                     data = bytes(self.uc.mem_read(r1, 12))
                     xitemvalue, pxnext, pxprev = struct.unpack("<3I", data)
-                    if pxnext == r1 or pxprev == r1:
-                        # 自引用:项已在列表中 (损坏)。
-                        # 完全重置:item 的指针全部清零,列表变为空列表。
-                        list_end = r0 + 8  # &xListEnd
-
+                    # 检测损坏:自引用或 pxNext 指向 list_end(已在列表末尾)或形成环
+                    list_end = r0 + 8  # &xListEnd
+                    is_corrupt = (pxnext == r1 or pxprev == r1 or
+                                  pxnext == 0 or pxprev == 0)
+                    # 也检测环:遍历 pxNext 链,如果回到 r1 或超过 32 步,视为环
+                    if not is_corrupt and pxnext and 0x20000000 <= pxnext < 0x20040000:
+                        cur = pxnext
+                        for _ in range(32):
+                            try:
+                                nx = struct.unpack("<I", bytes(self.uc.mem_read(cur + 4, 4)))[0]
+                                if nx == r1 or nx == cur:
+                                    is_corrupt = True
+                                    break
+                                if nx == 0 or nx == list_end:
+                                    break
+                                cur = nx
+                            except Exception:
+                                break
+                    if is_corrupt:
                         # 重置 item:pxNext=NULL, pxPrevious=NULL, pxContainer=NULL
                         self.uc.mem_write(r1 + 4, struct.pack("<I", 0))   # pxNext
                         self.uc.mem_write(r1 + 8, struct.pack("<I", 0))   # pxPrevious
                         self.uc.mem_write(r1 + 0x10, struct.pack("<I", 0)) # pxContainer
 
-                        # 重置列表为空:xListEnd 指向自身
-                        self.uc.mem_write(list_end + 4, struct.pack("<I", list_end)) # end.pxNext
-                        self.uc.mem_write(list_end + 8, struct.pack("<I", list_end)) # end.pxPrevious
-                        # uxNumberOfItems = 0
-                        self.uc.mem_write(r0, struct.pack("<I", 0))
+                        # 重置列表为空:
+                        # List_t: [0]=uxNumberOfItems, [4]=pxIndex, [8]=xListEnd.xItemValue,
+                        #         [12]=xListEnd.pxNext, [16]=xListEnd.pxPrevious
+                        # xListEnd.xItemValue 必须设为 portMAX_DELAY (0xFFFFFFFF)!
+                        # 否则 vListInsert 循环条件 pxNext->xItemValue <= xValueOfInsertion
+                        # 在空列表上永远为 true (0 <= anything),导致死循环。
+                        self.uc.mem_write(r0 + 0, struct.pack("<I", 0))           # uxNumberOfItems = 0
+                        self.uc.mem_write(r0 + 4, struct.pack("<I", list_end))    # pxIndex = &xListEnd
+                        self.uc.mem_write(list_end + 0, struct.pack("<I", 0xFFFFFFFF))  # xItemValue = portMAX_DELAY
+                        self.uc.mem_write(list_end + 4, struct.pack("<I", list_end))    # end.pxNext = &xListEnd
+                        self.uc.mem_write(list_end + 8, struct.pack("<I", list_end))    # end.pxPrevious = &xListEnd
 
                         # 从 vListInsert 函数开头重新执行 (0x08017FC2)
                         # R0=list, R1=item 仍然有效
@@ -1325,8 +1809,24 @@ class FlipperVM:
                 self._fire_exception(EXC_SYSTICK)
         self._dispatch_pending_irq()
 
+    def _advance_periph_timers(self, n_executed: int) -> None:
+        """推进 LPTIM 等自由运行定时器计数。"""
+        # LPTIM 输入时钟通常 32.768kHz 或 LSI/4,但为了防止固件等太久,
+        # 这里按 1:1 与 CPU 同步推进(等效非常快的 LPTIM 时钟,尽快触发 ARRM 唤醒)。
+        try:
+            self.lptim1.advance(n_executed)
+        except Exception:
+            pass
+        try:
+            self.lptim2.advance(n_executed)
+        except Exception:
+            pass
+
     def _check_systick(self, n_executed: int) -> None:
         """检查 SysTick 是否到期并触发异常。"""
+        # 先推进 LPTIM:保证即便还没到 FreeRTOS 配置 SysTick,
+        # 早期的 LPTIM 睡眠(bootloader/初始化阶段)也能被唤醒
+        self._advance_periph_timers(n_executed)
         if (self.systick_ctrl & 0x1) and self.systick_load:
             self.systick_countdown -= n_executed
             if self.systick_countdown <= 0:
@@ -1339,8 +1839,9 @@ class FlipperVM:
                     primask = self.uc.reg_read(UC_ARM_REG_PRIMASK)
                     basepri = self.uc.reg_read(UC_ARM_REG_BASEPRI)
                     # SysTick 优先级 (SHPR3 [31:24])
+                    # SHPR3 = SCB_SHPR + 8 = 0xE000ED20
                     shpr3 = int.from_bytes(
-                        self.ppb[SCB_SHPR + 4 - PPB_BASE:SCB_SHPR + 8 - PPB_BASE], "little")
+                        self.ppb[SCB_SHPR + 8 - PPB_BASE:SCB_SHPR + 12 - PPB_BASE], "little")
                     systick_prio = (shpr3 >> 24) & 0xFF
                     if primask or (basepri > 0 and systick_prio >= basepri):
                         # 中断被屏蔽,设为 pending
@@ -1423,6 +1924,8 @@ class FlipperVM:
         handler_addr = self._vector_address(exception)
         self.uc.reg_write(UC_ARM_REG_PC, handler_addr)
         self.in_handler += 1
+        self._exc_frame_stack.append((frame_sp, exc_return))
+        self._handler_instr_count = 0
         if exception >= IRQ0_OFFSET:
             irq = exception - IRQ0_OFFSET
             self.nvic_active[irq // 32] |= 1 << (irq % 32)
@@ -1442,6 +1945,35 @@ class FlipperVM:
             sp = self.uc.reg_read(UC_ARM_REG_MSP)
         frame = self.uc.mem_read(sp, 32)
         r0, r1, r2, r3, r12, lr, pc, xpsr = struct.unpack("<IIIIIIII", frame)
+        # 验证恢复的 PC 在有效 Flash 范围内
+        # 如果 PC 不在 Flash (如指向 SRAM=0x20000000),说明任务栈已损坏
+        # 此时跳到当前 pxCurrentTCB 指向的任务可能也无济于事,
+        # 直接跳到空闲任务或 Reset_Handler
+        if not (0x08000000 <= pc < 0x08300000):
+            # PC 无效 — 栈损坏。尝试用 Reset_Handler 恢复
+            if self.on_uart_tx and self._warn_64bit_count < 10:
+                self._warn_64bit_count += 1
+                msg = (f"\r\n[VM] Bad PC in exc return: 0x{pc:08X} "
+                       f"SP=0x{sp:08X} exc_ret=0x{exc_return:08X}\r\n")
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
+            if self.firmware is not None:
+                pc = (self.firmware.entry_point & 0xFFFFFFFE)
+                lr = 0xFFFFFFFF
+                # 重置栈
+                sp = self.firmware.initial_sp & 0xFFFFFFFF
+                self.uc.reg_write(UC_ARM_REG_MSP, sp)
+                self.uc.reg_write(UC_ARM_REG_PSP, 0)
+                self.in_handler = 0
+                self._exc_frame_stack.clear()
+                self._pendsv_pending = False
+                self._systick_pending = False
+                self.uc.reg_write(UC_ARM_REG_PC, pc | 1)
+                self.uc.reg_write(UC_ARM_REG_SP, sp)
+                self.uc.reg_write(UC_ARM_REG_LR, lr)
+                self.uc.reg_write(UC_ARM_REG_BASEPRI, 0)
+                self.uc.reg_write(UC_ARM_REG_PRIMASK, 0)
+                return
         self.uc.reg_write(UC_ARM_REG_R0, r0)
         self.uc.reg_write(UC_ARM_REG_R1, r1)
         self.uc.reg_write(UC_ARM_REG_R2, r2)
@@ -1460,6 +1992,8 @@ class FlipperVM:
             self.uc.reg_write(UC_ARM_REG_SP, sp)
         if self.in_handler > 0:
             self.in_handler -= 1
+        if self._exc_frame_stack:
+            self._exc_frame_stack.pop()
 
     # ---------- NVIC ----------
     def _pend_irq(self, irq: int) -> None:
@@ -1484,7 +2018,13 @@ class FlipperVM:
             off = address - per.base
             val = per.read(off, size)
             # 把读出的值写回影子内存,让 unicorn 把它送回程序
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            # 防御:val 可能 >32 位 (理论上不会,但保险起见)
+            write_size = min(size, 4)
+            val_masked = val & ((1 << (8 * write_size)) - 1)
+            try:
+                uc.mem_write(address & ~0x3, val_masked.to_bytes(write_size, "little"))
+            except Exception:
+                pass
 
     def _hook_mem_write(self, uc, access, address, size, value, user_data):
         per = self._find_peripheral(address)
@@ -1492,7 +2032,14 @@ class FlipperVM:
             off = address - per.base
             per.write(off, size, value)
             # 写入影子内存(对齐到 4 字节),避免后续读回污染
-            uc.mem_write(address & ~0x3, (value & ((1 << (8 * size)) - 1)).to_bytes(4, "little"))
+            # 关键:value 可能 >32 位 (Unicorn 在 Windows 上可能传递 64 位值)
+            # 必须先掩码,且 to_bytes 的长度必须与掩码后的值匹配
+            write_size = min(size, 4)
+            val_masked = value & ((1 << (8 * write_size)) - 1)
+            try:
+                uc.mem_write(address & ~0x3, val_masked.to_bytes(write_size, "little"))
+            except Exception:
+                pass
 
     def _find_peripheral(self, address: int) -> Optional[Peripheral]:
         # Find the most specific peripheral (smallest size) that contains the address.
@@ -1505,28 +2052,37 @@ class FlipperVM:
         return best
 
     # ---------- PPB(NVIC/SysTick/SCB)----------
+    def _safe_write_shadow(self, uc, address, val, size=4):
+        """安全地把值写入影子内存,自动掩码到 32 位防止 OverflowError。"""
+        write_size = min(size, 4)
+        val_masked = val & ((1 << (8 * write_size)) - 1)
+        try:
+            uc.mem_write(address & ~0x3, val_masked.to_bytes(write_size, "little"))
+        except Exception:
+            pass
+
     def _hook_ppb_read(self, uc, access, address, size, value, user_data):
         off = address - PPB_BASE
         # SysTick
         if SYSTICK_BASE <= address < SYSTICK_BASE + 0x10:
             val = self._systick_read(address - SYSTICK_BASE, size)
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # DWT (Data Watchpoint and Trace)
         if DWT_BASE <= address < DWT_BASE + 0x20:
             val = self._dwt_read(address - DWT_BASE, size)
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # DEMCR: TRCENA bit always set (DWT enabled)
         if address == DEMCR:
             val = int.from_bytes(self.ppb[off:off + size], "little")
             val |= DEMCR_TRCENA
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # NVIC ISER/ISPR/ICPR 寄存器
         if NVIC_BASE <= address < NVIC_BASE + 0x300:
             val = self._nvic_read(address - NVIC_BASE, size)
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # SCB_ICSR: 返回 PendSV/SysTick pending 状态
         if address == SCB_ICSR:
@@ -1535,36 +2091,37 @@ class FlipperVM:
                 val |= SCB_ICSR_PENDSVSET
             if self._systick_pending:
                 val |= SCB_ICSR_PENDSTSET
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # SCB_VTOR: 固件 SystemInit 会写 0 清零,但在真实硬件上 VTOR=0 表示
         # 使用默认启动地址(Flash 基址 0x08000000)。始终返回 FLASH_BASE。
         if address == SCB_VTOR:
-            val = FLASH_BASE
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, FLASH_BASE, size)
             return
         # SCB_CCR: 确保 STACKALIGN=1 (8字节栈对齐), UNALIGN_TRP=1 (未对齐访问触发异常)
         if address == SCB_CCR:
             val = int.from_bytes(self.ppb[off:off + size], "little")
             val |= (1 << 9) | (1 << 3)  # STKALIGN | UNALIGN_TRP
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # SCB_SHPR (System Handler Priority Register): 返回存储的优先级
         if SCB_SHPR <= address < SCB_SHPR + 0xC:
             val = int.from_bytes(self.ppb[off:off + size], "little")
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # CPACR (Coprocessor Access Control): 返回 FP FUll Access (0xF00000)
         if address == 0xE000ED88:
             val = int.from_bytes(self.ppb[off:off + size], "little")
             val |= 0x00F00000  # CP10/CP11 full access
-            uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+            self._safe_write_shadow(uc, address, val, size)
             return
         # SCB 其它
         val = int.from_bytes(self.ppb[off:off + size], "little")
-        uc.mem_write(address & ~0x3, val.to_bytes(4, "little"))
+        self._safe_write_shadow(uc, address, val, size)
 
     def _hook_ppb_write(self, uc, access, address, size, value, user_data):
+        # 防御:value 可能 >32 位 (Unicorn Windows bug),先掩码
+        value &= 0xFFFFFFFF
         off = address - PPB_BASE
         if SYSTICK_BASE <= address < SYSTICK_BASE + 0x10:
             self._systick_write(address - SYSTICK_BASE, size, value)
@@ -1690,16 +2247,92 @@ class FlipperVM:
         #   0xFFFFFFFF 是 FreeRTOS 的 portMAX_DELAY,也是链表末尾哨兵值。
         #   当固件遍历损坏的链表(节点指针为 0x8BADF00D 等)时,
         #   读取 0xFFFFFFFF 会使链表遍历循环终止,避免无限循环。
+
+        # 关键修复:Windows 上 Unicorn 可能不把寄存器截断到 32 位,
+        # 导致固件计算出 >32 位的地址 (如 0x1514A10D010)。
+        # 此时 mem_map 在 64 位地址上可能失败,需要特殊处理。
+        if address > 0xFFFFFFFF:
+            return self._handle_64bit_access(uc, access, address, size, value)
+
+        # 判断是否为写访问:
+        # Unicorn 1.x: UC_MEM_WRITE_UNMAPPED = 2
+        # Unicorn 2.x: UC_MEM_WRITE_UNMAPPED = 20
+        is_write = access in (2, 20, UC_MEM_WRITE_UNMAPPED)
+
         try:
             page = address & ~0xFFF
             uc.mem_map(page, 0x1000, UC_PROT_ALL)
             # 填充 0xFF (而非默认的 0x00)
             uc.mem_write(page, b"\xff" * 0x1000)
-            if access == 2:  # WRITE
-                uc.mem_write(address, (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little"))
+            if is_write:
+                write_size = min(size, 4)
+                val_masked = value & ((1 << (8 * write_size)) - 1)
+                uc.mem_write(address, val_masked.to_bytes(write_size, "little"))
             return True
         except Exception:
             return False
+
+    def _handle_64bit_access(self, uc, access, address, size, value):
+        """处理 Windows 上 Unicorn 产生的 >32 位地址访问。
+
+        策略:
+        1. 尝试在完整 64 位地址上映射页面 (Linux 上可行)
+        2. 如果失败,截断到 32 位,在 32 位地址上处理
+        3. 调用 emu_stop() 阻止 Unicorn 重试 64 位地址
+        4. step() 中会检测 emu_stop 并推进 PC
+        """
+        is_write = access in (2, 20, UC_MEM_WRITE_UNMAPPED)
+        addr32 = address & 0xFFFFFFFF
+
+        # 策略 1:尝试在 64 位地址上映射
+        try:
+            page = address & ~0xFFF
+            uc.mem_map(page, 0x1000, UC_PROT_ALL)
+            uc.mem_write(page, b"\xff" * 0x1000)
+            if is_write:
+                write_size = min(size, 4)
+                val_masked = value & ((1 << (8 * write_size)) - 1)
+                uc.mem_write(address, val_masked.to_bytes(write_size, "little"))
+            return True
+        except Exception:
+            pass
+
+        # 策略 2:64 位映射失败,在截断的 32 位地址上处理
+        # 先确保 32 位地址所在的页面已映射
+        page32 = addr32 & ~0xFFF
+        try:
+            uc.mem_map(page32, 0x1000, UC_PROT_ALL)
+            uc.mem_write(page32, b"\xff" * 0x1000)
+        except Exception:
+            pass  # 页面可能已映射
+
+        # 在 32 位地址上执行读/写
+        if is_write:
+            write_size = min(size, 4)
+            val_masked = value & ((1 << (8 * write_size)) - 1)
+            try:
+                uc.mem_write(addr32, val_masked.to_bytes(write_size, "little"))
+            except Exception:
+                pass
+
+        # 关键:调用 emu_stop() 阻止 Unicorn 在 64 位地址上重试
+        # step() 中会检测 _emu_stopped_early 并推进 PC 跳过当前指令
+        self._emu_stopped_early = True
+        self._skip_current_instr = True
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+
+        # 记录此事件用于诊断
+        if self.on_uart_tx and getattr(self, '_warn_64bit_count', 0) < 3:
+            self._warn_64bit_count = getattr(self, '_warn_64bit_count', 0) + 1
+            pc = uc.reg_read(UC_ARM_REG_PC)
+            msg = f"\r\n[VM] WARN: 64-bit addr 0x{address:X} -> 0x{addr32:08X} (PC=0x{pc:08X})\r\n"
+            for ch in msg:
+                self.on_uart_tx(ord(ch))
+
+        return True
 
     def _hook_fetch_unmapped(self, uc, access, address, size, value, user_data):
         """代码取指从不映射地址(如固件跳转到 NULL/地址 0)。
@@ -1709,6 +2342,25 @@ class FlipperVM:
         此时调用 _return_from_exception 处理返回,并停止当前 emu_start,
         让 step() 从新的 PC 重新启动。
         """
+        # Windows 兼容:>32 位地址 (Unicorn 可能不截断寄存器)
+        # 截断到 32 位并重定向 PC
+        if address > 0xFFFFFFFF:
+            addr32 = address & 0xFFFFFFFF
+            # 设置 PC 到截断的 32 位地址
+            self.uc.reg_write(UC_ARM_REG_PC, addr32 | 1)
+            self._emu_stopped_early = True
+            self._skip_current_instr = False  # 不跳过,而是从新 PC 重新执行
+            try:
+                uc.emu_stop()
+            except Exception:
+                pass
+            if self.on_uart_tx and getattr(self, '_warn_64bit_count', 0) < 3:
+                self._warn_64bit_count = getattr(self, '_warn_64bit_count', 0) + 1
+                msg = f"\r\n[VM] WARN: 64-bit fetch 0x{address:X} -> 0x{addr32:08X}\r\n"
+                for ch in msg:
+                    self.on_uart_tx(ord(ch))
+            return True
+
         # 检查是否是 EXC_RETURN 值 (0xFFFFFFF1/0xFFFFFFF9/0xFFFFFFFD)
         if 0xFFFFFFF0 <= address <= 0xFFFFFFFF:
             lr = uc.reg_read(UC_ARM_REG_LR)
@@ -1746,16 +2398,16 @@ class FlipperVM:
             uc.emu_stop()
 
     def _hook_vlist_insert(self, uc, address, size, user_data):
-        """vListInsert 入口钩子:在插入前检查 item 是否已在某个列表中。
+        """vListInsert 入口钩子:仅在检测到自引用环时清理,避免死循环。
 
-        FreeRTOS 正确用法是先 uxListRemove 再 vListInsert。如果固件跳过了
-        uxListRemove(或临界区保护失效),item 仍带有旧的 pxNext/pxPrevious,
-        vListInsert 的插入代码会创建自引用环导致死循环。
+        FreeRTOS 正确用法是先 uxListRemove 再 vListInsert。如果临界区保护失效,
+        item 仍带有旧的 pxNext/pxPrevious,vListInsert 会创建自引用环导致死循环。
 
-        此钩子在 vListInsert 入口处:
-          1. 读取 item->pxContainer (offset 0x10)
-          2. 如果非 NULL,item 已在某个列表中 → 执行 uxListRemove
-          3. 如果 item->pxNext == item (自引用),也执行清理
+        策略:
+          - 只在 item->pxNext == item 或 pxPrevious == item (真正的自引用环) 时干预
+          - 不因为 pxContainer != NULL 就移除 (那是正常的"已在列表中"状态,
+            FreeRTOS 会先用 uxListRemove 再 vListInsert,这是正常流程)
+          - 不跳过函数执行,让固件代码正常完成插入
         """
         r0 = uc.reg_read(UC_ARM_REG_R0)  # List_t *
         r1 = uc.reg_read(UC_ARM_REG_R1)  # ListItem_t * (new item)
@@ -1763,64 +2415,30 @@ class FlipperVM:
             return
         if not (r0 and 0x20000000 <= r0 < 0x20040000):
             return
+
         try:
             data = bytes(uc.mem_read(r1, 20))
             xvalue, pxnext, pxprev, pvowner, pxcontainer = struct.unpack("<5I", data)
         except Exception:
             return
 
-        # 检查:item 已在某个列表中 (pxContainer != NULL) 或有自引用
-        need_remove = False
-        if pxcontainer != 0 and 0x20000000 <= pxcontainer < 0x20040000:
-            need_remove = True
-        if pxnext == r1 or pxprev == r1:
-            need_remove = True
+        # 只检测真正的自引用环 (pxNext==item 或 pxPrevious==item)
+        # 这种情况 vListInsert 会无限循环,必须干预
+        if pxnext != r1 and pxprev != r1:
+            return  # 没有自引用环,让固件正常执行
 
-        if not need_remove:
-            return
+        # 检测到自引用环 — 清理 item 指针,让 vListInsert 正常插入
+        if self.on_uart_tx and self._warn_64bit_count < 20:
+            self._warn_64bit_count += 1
+            msg = (f"\x0a[VM] self-loop in item 0x{r1:08X}, cleaning\x0a")
+            for ch in msg:
+                self.on_uart_tx(ord(ch))
 
-        # 执行 uxListRemove:从旧列表中移除 item
-        old_list = pxcontainer
-        if old_list == 0 or not (0x20000000 <= old_list < 0x20040000):
-            # pxContainer 无效,只清理 item 指针
-            uc.mem_write(r1 + 4, struct.pack("<I", 0))   # pxNext = NULL
-            uc.mem_write(r1 + 8, struct.pack("<I", 0))   # pxPrevious = NULL
-            uc.mem_write(r1 + 0x10, struct.pack("<I", 0)) # pxContainer = NULL
-            return
-
-        try:
-            # item->pxNext->pxPrevious = item->pxPrevious
-            if pxnext and 0x20000000 <= pxnext < 0x20040000:
-                uc.mem_write(pxnext + 8, struct.pack("<I", pxprev if pxprev != r1 else old_list + 8))
-            # item->pxPrevious->pxNext = item->pxNext
-            if pxprev and 0x20000000 <= pxprev < 0x20040000 and pxprev != r1:
-                uc.mem_write(pxprev + 4, struct.pack("<I", pxnext if pxnext != r1 else old_list + 8))
-            # 如果 pxIndex 指向 item,改为指向前驱
-            try:
-                pxindex = struct.unpack("<I", bytes(uc.mem_read(old_list + 4, 4)))[0]
-                if pxindex == r1:
-                    uc.mem_write(old_list + 4, struct.pack("<I", pxprev if pxprev != r1 else old_list + 8))
-            except:
-                pass
-            # item->pxContainer = NULL
-            uc.mem_write(r1 + 0x10, struct.pack("<I", 0))
-            # item->pxNext = NULL, pxPrevious = NULL
-            uc.mem_write(r1 + 4, struct.pack("<I", 0))
-            uc.mem_write(r1 + 8, struct.pack("<I", 0))
-            # old_list->uxNumberOfItems--
-            try:
-                nitems = struct.unpack("<I", bytes(uc.mem_read(old_list, 4)))[0]
-                if nitems > 0:
-                    uc.mem_write(old_list, struct.pack("<I", nitems - 1))
-            except:
-                pass
-            self._vlist_remove_count += 1
-            if self.on_uart_tx and self._vlist_remove_count <= 5:
-                msg = "[VM] auto-uxListRemove: item 0x%08X from list 0x%08X\n" % (r1, old_list)
-                for ch in msg:
-                    self.on_uart_tx(ord(ch))
-        except Exception:
-            pass
+        # 清理自引用指针
+        uc.mem_write(r1 + 4, struct.pack("<I", 0))   # pxNext = NULL
+        uc.mem_write(r1 + 8, struct.pack("<I", 0))   # pxPrevious = NULL
+        # 注意:不设置 pxContainer,让 vListInsert 正常设置它
+        # 不跳过函数 — 让固件代码完成正常的插入逻辑
 
     # ---------- 中断钩子(处理 SVC/PendSV/EXC_RETURN)----------
     def _hook_intr(self, uc, intno, user_data):
