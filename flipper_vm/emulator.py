@@ -521,14 +521,14 @@ class FlipperVM:
         self.dmamux = Peripheral(DMAMUX1_BASE, 0x100, "DMAMUX1")
         self.crc = Peripheral(CRC_BASE, 0x40, "CRC")
         self.adc = Peripheral(ADC_BASE, 0x400, "ADC")
-        self.aes1 = Peripheral(AES1_BASE, 0x400, "AES1")
-        self.aes2 = Peripheral(AES2_BASE, 0x400, "AES2")
+        self.aes1 = Peripheral(AES1_BASE, 0x100, "AES1")
+        self.aes2 = Peripheral(AES2_BASE, 0x100, "AES2")
         self.tim2 = Peripheral(TIM2_BASE, 0x400, "TIM2")
         self.i2c1 = Peripheral(I2C1_BASE, 0x400, "I2C1")
         # 双核通信外设:CPU1 <-> CPU2 (Radio IPCC + 硬件信号量 + PKA + RTC)
         self.ipcc = IPCC(IPCC_BASE, 0x100, "IPCC")
-        self.hwsem = HWSEM(HWSEM_BASE, 0x400, "HWSEM")
-        self.pka = PKA(PKA_BASE, 0x1000, "PKA")
+        self.hwsem = HWSEM(HWSEM_BASE, 0x100, "HWSEM")
+        self.pka = PKA(PKA_BASE, 0x800, "PKA")
         self.saes = Peripheral(SAES_BASE, 0x100, "SAES")
         self.rtc = RTC(RTC_BASE, 0x1000, "RTC")
 
@@ -834,10 +834,14 @@ class FlipperVM:
             uc.mem_write(address & ~0x3, (value & ((1 << (8 * size)) - 1)).to_bytes(4, "little"))
 
     def _find_peripheral(self, address: int) -> Optional[Peripheral]:
+        # Find the most specific peripheral (smallest size) that contains the address.
+        # This prevents overlap issues where a large peripheral shadow covers a smaller one.
+        best = None
         for base, per in self.peripherals.items():
             if per.base <= address < per.base + per.size:
-                return per
-        return None
+                if best is None or per.size < best.size:
+                    best = per
+        return best
 
     # ---------- PPB(NVIC/SysTick/SCB)----------
     def _hook_ppb_read(self, uc, access, address, size, value, user_data):
